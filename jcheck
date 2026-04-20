@@ -1,36 +1,21 @@
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 import pandas as pd
-
-# =========================================================
-# CONFIG
-# =========================================================
 
 RESULTS_ROOT = Path("/path/to/results")
 GROUND_TRUTH_ROOT = Path("/path/to/ground_truth")
 
-# For each folder type, specify the route to the object you want to compare.
-# Example:
-# "A": "response.final_output"
-# means go to json_obj["response"]["final_output"]
-#
-# The object at that route is expected to look like:
-# {"r1": "v1", "r2": "v2", ...}
 ROUTES_BY_FOLDER = {
     "A": "response.final_output",
     "B": "prediction.entities",
     "C": "output",
 }
 
-# Optional normalization
 CASE_INSENSITIVE_STRINGS = False
 STRIP_STRINGS = True
+VALUE_FIELD = "value"
 
-
-# =========================================================
-# HELPERS
-# =========================================================
 
 def load_json(path: Path) -> Any:
     with open(path, "r", encoding="utf-8") as f:
@@ -47,12 +32,6 @@ def normalize_value(x: Any) -> Any:
 
 
 def get_by_route(obj: Any, route: str) -> Any:
-    """
-    Dotted path navigation:
-      'a.b.c' -> obj['a']['b']['c']
-      'items.0.name' -> obj['items'][0]['name']
-    Returns None if the route does not exist.
-    """
     cur = obj
     for part in route.split("."):
         if isinstance(cur, dict):
@@ -71,11 +50,17 @@ def get_by_route(obj: Any, route: str) -> Any:
     return cur
 
 
+def extract_value_field(x: Any, value_field: str = VALUE_FIELD) -> Any:
+    """
+    If x is a dict and contains `value_field`, return x[value_field].
+    Otherwise return x as-is.
+    """
+    if isinstance(x, dict) and value_field in x:
+        return x[value_field]
+    return x
+
+
 def flatten_value_for_cell(x: Any) -> Any:
-    """
-    Keep simple scalars as-is.
-    Convert complex objects/lists to compact JSON strings for display in table cells.
-    """
     if isinstance(x, (dict, list)):
         return json.dumps(x, ensure_ascii=False, sort_keys=True)
     return x
@@ -84,10 +69,6 @@ def flatten_value_for_cell(x: Any) -> Any:
 def list_relative_jsons(folder: Path) -> List[Path]:
     return sorted([p.relative_to(folder) for p in folder.rglob("*.json")])
 
-
-# =========================================================
-# CORE TABLE BUILDER
-# =========================================================
 
 def build_comparison_rows_for_folder(
     folder_name: str,
@@ -107,21 +88,12 @@ def build_comparison_rows_for_folder(
 
         try:
             pred_json = load_json(pred_path)
-        except Exception as e:
-            rows.append({
-                "folder": folder_name,
-                "file": str(rel_path),
-                "status": f"ERROR reading prediction: {e}",
-            })
-            continue
-
-        try:
             gt_json = load_json(gt_path)
         except Exception as e:
             rows.append({
                 "folder": folder_name,
                 "file": str(rel_path),
-                "status": f"ERROR reading ground truth: {e}",
+                "status": f"ERROR reading file: {e}",
             })
             continue
 
@@ -158,8 +130,11 @@ def build_comparison_rows_for_folder(
         total_count = 0
 
         for k in all_keys:
-            gt_val = normalize_value(gt_obj.get(k))
-            pred_val = normalize_value(pred_obj.get(k))
+            raw_gt = gt_obj.get(k)
+            raw_pred = pred_obj.get(k)
+
+            gt_val = normalize_value(extract_value_field(raw_gt))
+            pred_val = normalize_value(extract_value_field(raw_pred))
 
             row[f"{k}_gt"] = flatten_value_for_cell(gt_val)
             row[f"{k}_pred"] = flatten_value_for_cell(pred_val)
@@ -175,7 +150,6 @@ def build_comparison_rows_for_folder(
 
         rows.append(row)
 
-    # Track unmatched files too
     for rel_path in sorted(result_files - gt_files):
         rows.append({
             "folder": folder_name,
@@ -208,7 +182,7 @@ def build_full_comparison_table(
             all_rows.append({
                 "folder": folder_name,
                 "file": None,
-                "status": f"Missing results folder: {result_folder}"
+                "status": f"Missing results folder: {result_folder}",
             })
             continue
 
@@ -216,27 +190,46 @@ def build_full_comparison_table(
             all_rows.append({
                 "folder": folder_name,
                 "file": None,
-                "status": f"Missing ground truth folder: {gt_folder}"
+                "status": f"Missing ground truth folder: {gt_folder}",
             })
             continue
 
-        folder_rows = build_comparison_rows_for_folder(
-            folder_name=folder_name,
-            result_folder=result_folder,
-            gt_folder=gt_folder,
-            route=route,
+        all_rows.extend(
+            build_comparison_rows_for_folder(
+                folder_name=folder_name,
+                result_folder=result_folder,
+                gt_folder=gt_folder,
+                route=route,
+            )
         )
-        all_rows.extend(folder_rows)
 
     df = pd.DataFrame(all_rows)
 
-    # Put key metadata columns first
     preferred_first_cols = [
         "folder", "file", "status", "matched_fields", "total_fields", "row_accuracy"
     ]
     existing_first = [c for c in preferred_first_cols if c in df.columns]
-    other_cols = [c for c in df.columns if c not in existing_first]
-    df = df[existing_first + other_cols]
+
+    paired_cols = []
+    base_names = sorted({
+        c[:-3] for c in df.columns if c.endswith("_gt")
+    } | {
+        c[:-5] for c in df.columns if c.endswith("_pred")
+    })
+
+    for base in base_names:
+        for suffix in ["_gt", "_pred", "_match"]:
+            col = f"{base}{suffix}"
+            if col in df.columns:
+                paired_cols.append(col)
+
+    remaining_cols = [
+        c for c in df.columns
+        if c not in existing_first and c not in paired_cols
+    ]
+
+    df = df[existing_first + paired_cols + remaining_cols]
+    df = df.sort_values(["folder", "file"], na_position="last").reset_index(drop=True)
 
     return df
 
@@ -250,7 +243,6 @@ def build_folder_summary(df: pd.DataFrame) -> pd.DataFrame:
             "sum_total_fields", "field_accuracy", "exact_row_accuracy"
         ])
 
-    # exact row means all compared fields matched
     ok_df["exact_match"] = ok_df["matched_fields"] == ok_df["total_fields"]
 
     summary = (
@@ -269,10 +261,6 @@ def build_folder_summary(df: pd.DataFrame) -> pd.DataFrame:
 
     return summary
 
-
-# =========================================================
-# MAIN
-# =========================================================
 
 if __name__ == "__main__":
     df = build_full_comparison_table(
