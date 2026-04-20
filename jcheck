@@ -4,21 +4,28 @@ from typing import Any, Dict, List
 import pandas as pd
 
 
+# =========================================================
+# CONFIG
+# =========================================================
+
 RESULTS_ROOT = Path("/path/to/results")
 GROUND_TRUTH_ROOT = Path("/path/to/ground_truth")
 
+# Route for each folder type
 ROUTES_BY_FOLDER = {
     "A": "response.output",
     "B": "prediction.final",
     "C": "data.items",
 }
 
-ENTITY_KEY = "entity_name"
-VALUE_KEY = "value"
-
+# optional normalization
 STRIP_STRINGS = True
 CASE_INSENSITIVE_STRINGS = False
 
+
+# =========================================================
+# BASIC HELPERS
+# =========================================================
 
 def load_json(path: Path) -> Any:
     with open(path, "r", encoding="utf-8") as f:
@@ -35,6 +42,12 @@ def normalize_value(x: Any) -> Any:
 
 
 def get_by_route(obj: Any, route: str) -> Any:
+    """
+    Supports dotted paths like:
+      a.b.c
+      items.0.name
+    Returns None if route does not exist.
+    """
     cur = obj
     for part in route.split("."):
         if isinstance(cur, dict):
@@ -53,37 +66,65 @@ def get_by_route(obj: Any, route: str) -> Any:
     return cur
 
 
-def extract_value(x: Any, value_key: str = VALUE_KEY) -> Any:
-    if isinstance(x, dict):
-        return x.get(value_key)
-    return x
-
-
 def list_relative_jsons(folder: Path) -> List[Path]:
     return sorted([p.relative_to(folder) for p in folder.rglob("*.json")])
 
 
-def extract_record_fields(record: Dict[str, Any]) -> Dict[str, Any]:
+# =========================================================
+# RECURSIVE FLATTENING
+# =========================================================
+
+def flatten_all_value_paths(obj: Any, parent_key: str = "") -> Dict[str, Any]:
     """
-    Input example:
+    Recursively traverse obj and capture every key named 'value'.
+
+    Example input:
     {
         "entity_name": {"value": "Apple"},
-        "ticker": {"value": "AAPL"},
-        "country": {"value": "US"}
+        "issuer_info": {
+            "name": {"value": "Apple Inc"},
+            "country": {"value": "US"}
+        },
+        "terms": {
+            "coupon": {"value": 4.5}
+        }
     }
 
     Output:
     {
         "entity_name": "Apple",
-        "ticker": "AAPL",
-        "country": "US"
+        "issuer_info.name": "Apple Inc",
+        "issuer_info.country": "US",
+        "terms.coupon": 4.5
     }
-    """
-    out = {}
-    for k, v in record.items():
-        out[k] = normalize_value(extract_value(v))
-    return out
 
+    Notes:
+    - The actual 'value' leaf is recorded, but the output key drops the trailing '.value'
+    - Lists are supported via numeric path pieces, e.g. components.0.ticker
+    """
+    items = {}
+
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            new_key = f"{parent_key}.{k}" if parent_key else k
+
+            if k == "value":
+                clean_key = parent_key if parent_key else "value"
+                items[clean_key] = normalize_value(v)
+            else:
+                items.update(flatten_all_value_paths(v, new_key))
+
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            new_key = f"{parent_key}.{i}" if parent_key else str(i)
+            items.update(flatten_all_value_paths(v, new_key))
+
+    return items
+
+
+# =========================================================
+# BUILD ONE TABLE FOR ONE FOLDER
+# =========================================================
 
 def build_folder_dataframe(
     folder_name: str,
@@ -93,8 +134,8 @@ def build_folder_dataframe(
 ) -> pd.DataFrame:
     result_files = set(list_relative_jsons(result_folder))
     gt_files = set(list_relative_jsons(gt_folder))
-
     common_files = sorted(result_files & gt_files)
+
     rows = []
 
     # matched files
@@ -110,45 +151,46 @@ def build_folder_dataframe(
 
         try:
             pred_json = load_json(pred_path)
-            gt_json = load_json(gt_path)
         except Exception as e:
-            row["status"] = f"ERROR reading file: {e}"
+            row["status"] = f"ERROR reading prediction: {e}"
             rows.append(row)
             continue
 
-        pred_record = get_by_route(pred_json, route)
-        gt_record = get_by_route(gt_json, route)
+        try:
+            gt_json = load_json(gt_path)
+        except Exception as e:
+            row["status"] = f"ERROR reading ground truth: {e}"
+            rows.append(row)
+            continue
 
-        if pred_record is None:
+        pred_subtree = get_by_route(pred_json, route)
+        gt_subtree = get_by_route(gt_json, route)
+
+        if pred_subtree is None:
             row["status"] = "Missing route in prediction"
             rows.append(row)
             continue
 
-        if gt_record is None:
+        if gt_subtree is None:
             row["status"] = "Missing route in ground truth"
             rows.append(row)
             continue
 
-        if not isinstance(pred_record, dict) or not isinstance(gt_record, dict):
-            row["status"] = "Route does not point to dict in both files"
-            rows.append(row)
-            continue
+        pred_flat = flatten_all_value_paths(pred_subtree)
+        gt_flat = flatten_all_value_paths(gt_subtree)
 
-        pred_fields = extract_record_fields(pred_record)
-        gt_fields = extract_record_fields(gt_record)
-
-        all_fields = sorted(set(pred_fields.keys()) | set(gt_fields.keys()))
+        all_attrs = sorted(set(pred_flat.keys()) | set(gt_flat.keys()))
 
         matched_fields = 0
         total_fields = 0
 
-        for field in all_fields:
-            gt_val = gt_fields.get(field)
-            pred_val = pred_fields.get(field)
+        for attr in all_attrs:
+            gt_val = gt_flat.get(attr)
+            pred_val = pred_flat.get(attr)
 
-            row[f"{field}_gt"] = gt_val
-            row[f"{field}_pred"] = pred_val
-            row[f"{field}_match"] = (gt_val == pred_val)
+            row[f"{attr}_gt"] = gt_val
+            row[f"{attr}_pred"] = pred_val
+            row[f"{attr}_match"] = (gt_val == pred_val)
 
             total_fields += 1
             if gt_val == pred_val:
@@ -182,15 +224,17 @@ def build_folder_dataframe(
         return df
 
     # nice column ordering
-    first_cols = [
-        "folder", "file", "status",
-        f"{ENTITY_KEY}_gt", f"{ENTITY_KEY}_pred", f"{ENTITY_KEY}_match",
-        "matched_fields", "total_fields", "row_accuracy"
+    fixed_first = [
+        "folder",
+        "file",
+        "status",
+        "matched_fields",
+        "total_fields",
+        "row_accuracy",
     ]
-    first_cols = [c for c in first_cols if c in df.columns]
+    fixed_first = [c for c in fixed_first if c in df.columns]
 
-    paired_cols = []
-    base_names = sorted({
+    attr_bases = sorted({
         c[:-3] for c in df.columns if c.endswith("_gt")
     } | {
         c[:-5] for c in df.columns if c.endswith("_pred")
@@ -198,31 +242,34 @@ def build_folder_dataframe(
         c[:-6] for c in df.columns if c.endswith("_match")
     })
 
-    # Put entity_name first, others after
-    base_names = [b for b in base_names if b != ENTITY_KEY]
-    for base in base_names:
+    paired_cols = []
+    for base in attr_bases:
         for suffix in ["_gt", "_pred", "_match"]:
             col = f"{base}{suffix}"
-            if col in df.columns and col not in first_cols:
+            if col in df.columns and col not in fixed_first:
                 paired_cols.append(col)
 
     remaining_cols = [
         c for c in df.columns
-        if c not in first_cols and c not in paired_cols
+        if c not in fixed_first and c not in paired_cols
     ]
 
-    df = df[first_cols + paired_cols + remaining_cols]
+    df = df[fixed_first + paired_cols + remaining_cols]
     df = df.sort_values(["file"], na_position="last").reset_index(drop=True)
 
     return df
 
+
+# =========================================================
+# BUILD ALL TABLES
+# =========================================================
 
 def build_all_tables(
     results_root: Path,
     gt_root: Path,
     routes_by_folder: Dict[str, str],
 ) -> Dict[str, pd.DataFrame]:
-    tables_by_folder = {}
+    tables_by_folder: Dict[str, pd.DataFrame] = {}
 
     for folder_name, route in routes_by_folder.items():
         result_folder = results_root / folder_name
@@ -244,31 +291,38 @@ def build_all_tables(
             }])
             continue
 
-        df = build_folder_dataframe(
+        tables_by_folder[folder_name] = build_folder_dataframe(
             folder_name=folder_name,
             result_folder=result_folder,
             gt_folder=gt_folder,
             route=route,
         )
-        tables_by_folder[folder_name] = df
 
     return tables_by_folder
 
+
+# =========================================================
+# SUMMARY TABLES
+# =========================================================
 
 def build_summary_table(tables_by_folder: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     summary_rows = []
 
     for folder_name, df in tables_by_folder.items():
-        if df.empty:
+        if df.empty or "status" not in df.columns:
             summary_rows.append({
                 "folder": folder_name,
                 "files_compared": 0,
                 "field_accuracy": None,
                 "exact_match_rate": None,
+                "missing_in_gt": 0,
+                "missing_in_pred": 0,
             })
             continue
 
         ok_df = df[df["status"] == "OK"].copy()
+        missing_in_gt = (df["status"] == "Missing in ground truth").sum()
+        missing_in_pred = (df["status"] == "Missing in prediction").sum()
 
         if ok_df.empty:
             summary_rows.append({
@@ -276,6 +330,8 @@ def build_summary_table(tables_by_folder: Dict[str, pd.DataFrame]) -> pd.DataFra
                 "files_compared": 0,
                 "field_accuracy": None,
                 "exact_match_rate": None,
+                "missing_in_gt": int(missing_in_gt),
+                "missing_in_pred": int(missing_in_pred),
             })
             continue
 
@@ -286,13 +342,53 @@ def build_summary_table(tables_by_folder: Dict[str, pd.DataFrame]) -> pd.DataFra
 
         summary_rows.append({
             "folder": folder_name,
-            "files_compared": files_compared,
+            "files_compared": int(files_compared),
             "field_accuracy": total_matched / total_fields if total_fields else None,
             "exact_match_rate": exact_matches / files_compared if files_compared else None,
+            "missing_in_gt": int(missing_in_gt),
+            "missing_in_pred": int(missing_in_pred),
         })
 
     return pd.DataFrame(summary_rows)
 
+
+def build_per_field_accuracy_table(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    For one folder dataframe, compute per-attribute accuracy.
+    Only uses rows with status == 'OK'.
+    """
+    if df.empty or "status" not in df.columns:
+        return pd.DataFrame(columns=["field", "matches", "total", "accuracy"])
+
+    ok_df = df[df["status"] == "OK"].copy()
+    if ok_df.empty:
+        return pd.DataFrame(columns=["field", "matches", "total", "accuracy"])
+
+    match_cols = [c for c in ok_df.columns if c.endswith("_match")]
+
+    rows = []
+    for col in match_cols:
+        field = col[:-6]
+        valid = ok_df[col].notna()
+        total = valid.sum()
+        matches = ok_df.loc[valid, col].sum() if total else 0
+
+        rows.append({
+            "field": field,
+            "matches": int(matches),
+            "total": int(total),
+            "accuracy": (matches / total) if total else None,
+        })
+
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.sort_values(["accuracy", "field"], ascending=[True, True]).reset_index(drop=True)
+    return out
+
+
+# =========================================================
+# MAIN
+# =========================================================
 
 if __name__ == "__main__":
     tables_by_folder = build_all_tables(
@@ -303,11 +399,16 @@ if __name__ == "__main__":
 
     summary_df = build_summary_table(tables_by_folder)
 
-    # save each folder table separately
+    # save one comparison table per folder
     for folder_name, df in tables_by_folder.items():
-        out_path = f"comparison_{folder_name}.csv"
-        df.to_csv(out_path, index=False)
-        print(f"Saved {out_path}")
+        out_csv = f"comparison_{folder_name}.csv"
+        df.to_csv(out_csv, index=False)
+        print(f"Saved {out_csv}")
+
+        per_field_df = build_per_field_accuracy_table(df)
+        per_field_csv = f"comparison_{folder_name}_field_accuracy.csv"
+        per_field_df.to_csv(per_field_csv, index=False)
+        print(f"Saved {per_field_csv}")
 
     summary_df.to_csv("comparison_summary.csv", index=False)
     print("Saved comparison_summary.csv")
