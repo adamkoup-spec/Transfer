@@ -1,0 +1,300 @@
+import json
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+import pandas as pd
+
+# =========================================================
+# CONFIG
+# =========================================================
+
+RESULTS_ROOT = Path("/path/to/results")
+GROUND_TRUTH_ROOT = Path("/path/to/ground_truth")
+
+# For each folder type, specify the route to the object you want to compare.
+# Example:
+# "A": "response.final_output"
+# means go to json_obj["response"]["final_output"]
+#
+# The object at that route is expected to look like:
+# {"r1": "v1", "r2": "v2", ...}
+ROUTES_BY_FOLDER = {
+    "A": "response.final_output",
+    "B": "prediction.entities",
+    "C": "output",
+}
+
+# Optional normalization
+CASE_INSENSITIVE_STRINGS = False
+STRIP_STRINGS = True
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+
+def load_json(path: Path) -> Any:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def normalize_value(x: Any) -> Any:
+    if isinstance(x, str):
+        if STRIP_STRINGS:
+            x = x.strip()
+        if CASE_INSENSITIVE_STRINGS:
+            x = x.lower()
+    return x
+
+
+def get_by_route(obj: Any, route: str) -> Any:
+    """
+    Dotted path navigation:
+      'a.b.c' -> obj['a']['b']['c']
+      'items.0.name' -> obj['items'][0]['name']
+    Returns None if the route does not exist.
+    """
+    cur = obj
+    for part in route.split("."):
+        if isinstance(cur, dict):
+            if part not in cur:
+                return None
+            cur = cur[part]
+        elif isinstance(cur, list):
+            if not part.isdigit():
+                return None
+            idx = int(part)
+            if idx < 0 or idx >= len(cur):
+                return None
+            cur = cur[idx]
+        else:
+            return None
+    return cur
+
+
+def flatten_value_for_cell(x: Any) -> Any:
+    """
+    Keep simple scalars as-is.
+    Convert complex objects/lists to compact JSON strings for display in table cells.
+    """
+    if isinstance(x, (dict, list)):
+        return json.dumps(x, ensure_ascii=False, sort_keys=True)
+    return x
+
+
+def list_relative_jsons(folder: Path) -> List[Path]:
+    return sorted([p.relative_to(folder) for p in folder.rglob("*.json")])
+
+
+# =========================================================
+# CORE TABLE BUILDER
+# =========================================================
+
+def build_comparison_rows_for_folder(
+    folder_name: str,
+    result_folder: Path,
+    gt_folder: Path,
+    route: str,
+) -> List[Dict[str, Any]]:
+    result_files = set(list_relative_jsons(result_folder))
+    gt_files = set(list_relative_jsons(gt_folder))
+    common_files = sorted(result_files & gt_files)
+
+    rows = []
+
+    for rel_path in common_files:
+        pred_path = result_folder / rel_path
+        gt_path = gt_folder / rel_path
+
+        try:
+            pred_json = load_json(pred_path)
+        except Exception as e:
+            rows.append({
+                "folder": folder_name,
+                "file": str(rel_path),
+                "status": f"ERROR reading prediction: {e}",
+            })
+            continue
+
+        try:
+            gt_json = load_json(gt_path)
+        except Exception as e:
+            rows.append({
+                "folder": folder_name,
+                "file": str(rel_path),
+                "status": f"ERROR reading ground truth: {e}",
+            })
+            continue
+
+        pred_obj = get_by_route(pred_json, route)
+        gt_obj = get_by_route(gt_json, route)
+
+        if pred_obj is None or gt_obj is None:
+            rows.append({
+                "folder": folder_name,
+                "file": str(rel_path),
+                "status": f"Missing route in {'prediction' if pred_obj is None else 'ground truth'}",
+            })
+            continue
+
+        if not isinstance(pred_obj, dict) or not isinstance(gt_obj, dict):
+            rows.append({
+                "folder": folder_name,
+                "file": str(rel_path),
+                "status": "Route does not point to a dict in both files",
+                "gt_extracted": flatten_value_for_cell(gt_obj),
+                "pred_extracted": flatten_value_for_cell(pred_obj),
+            })
+            continue
+
+        all_keys = sorted(set(gt_obj.keys()) | set(pred_obj.keys()))
+
+        row = {
+            "folder": folder_name,
+            "file": str(rel_path),
+            "status": "OK",
+        }
+
+        match_count = 0
+        total_count = 0
+
+        for k in all_keys:
+            gt_val = normalize_value(gt_obj.get(k))
+            pred_val = normalize_value(pred_obj.get(k))
+
+            row[f"{k}_gt"] = flatten_value_for_cell(gt_val)
+            row[f"{k}_pred"] = flatten_value_for_cell(pred_val)
+            row[f"{k}_match"] = (gt_val == pred_val)
+
+            total_count += 1
+            if gt_val == pred_val:
+                match_count += 1
+
+        row["matched_fields"] = match_count
+        row["total_fields"] = total_count
+        row["row_accuracy"] = match_count / total_count if total_count else None
+
+        rows.append(row)
+
+    # Track unmatched files too
+    for rel_path in sorted(result_files - gt_files):
+        rows.append({
+            "folder": folder_name,
+            "file": str(rel_path),
+            "status": "Missing in ground truth",
+        })
+
+    for rel_path in sorted(gt_files - result_files):
+        rows.append({
+            "folder": folder_name,
+            "file": str(rel_path),
+            "status": "Missing in prediction",
+        })
+
+    return rows
+
+
+def build_full_comparison_table(
+    results_root: Path,
+    gt_root: Path,
+    routes_by_folder: Dict[str, str],
+) -> pd.DataFrame:
+    all_rows = []
+
+    for folder_name, route in routes_by_folder.items():
+        result_folder = results_root / folder_name
+        gt_folder = gt_root / folder_name
+
+        if not result_folder.exists():
+            all_rows.append({
+                "folder": folder_name,
+                "file": None,
+                "status": f"Missing results folder: {result_folder}"
+            })
+            continue
+
+        if not gt_folder.exists():
+            all_rows.append({
+                "folder": folder_name,
+                "file": None,
+                "status": f"Missing ground truth folder: {gt_folder}"
+            })
+            continue
+
+        folder_rows = build_comparison_rows_for_folder(
+            folder_name=folder_name,
+            result_folder=result_folder,
+            gt_folder=gt_folder,
+            route=route,
+        )
+        all_rows.extend(folder_rows)
+
+    df = pd.DataFrame(all_rows)
+
+    # Put key metadata columns first
+    preferred_first_cols = [
+        "folder", "file", "status", "matched_fields", "total_fields", "row_accuracy"
+    ]
+    existing_first = [c for c in preferred_first_cols if c in df.columns]
+    other_cols = [c for c in df.columns if c not in existing_first]
+    df = df[existing_first + other_cols]
+
+    return df
+
+
+def build_folder_summary(df: pd.DataFrame) -> pd.DataFrame:
+    ok_df = df[df["status"] == "OK"].copy()
+
+    if ok_df.empty:
+        return pd.DataFrame(columns=[
+            "folder", "files_compared", "sum_matched_fields",
+            "sum_total_fields", "field_accuracy", "exact_row_accuracy"
+        ])
+
+    # exact row means all compared fields matched
+    ok_df["exact_match"] = ok_df["matched_fields"] == ok_df["total_fields"]
+
+    summary = (
+        ok_df.groupby("folder", dropna=False)
+        .agg(
+            files_compared=("file", "count"),
+            sum_matched_fields=("matched_fields", "sum"),
+            sum_total_fields=("total_fields", "sum"),
+            exact_matches=("exact_match", "sum"),
+        )
+        .reset_index()
+    )
+
+    summary["field_accuracy"] = summary["sum_matched_fields"] / summary["sum_total_fields"]
+    summary["exact_row_accuracy"] = summary["exact_matches"] / summary["files_compared"]
+
+    return summary
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+if __name__ == "__main__":
+    df = build_full_comparison_table(
+        results_root=RESULTS_ROOT,
+        gt_root=GROUND_TRUTH_ROOT,
+        routes_by_folder=ROUTES_BY_FOLDER,
+    )
+
+    summary_df = build_folder_summary(df)
+
+    print("\n=== COMPARISON TABLE ===")
+    print(df.head(20).to_string(index=False))
+
+    print("\n=== SUMMARY ===")
+    if len(summary_df) > 0:
+        print(summary_df.to_string(index=False))
+    else:
+        print("No valid comparable rows found.")
+
+    df.to_csv("comparison_table.csv", index=False)
+    summary_df.to_csv("comparison_summary.csv", index=False)
+
+    print("\nSaved:")
+    print(" - comparison_table.csv")
+    print(" - comparison_summary.csv")
