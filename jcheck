@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Set
+from collections import defaultdict
 import pandas as pd
 
 
@@ -16,6 +17,22 @@ ROUTES_BY_FOLDER = {
     "A": "response.output",
     "B": "prediction.final",
     "C": "data.items",
+}
+
+# Rollup root per folder.
+# If None, rollup mode will use the top-most prefix of each flattened field.
+# Example:
+#   "address.street" -> group "address"
+#   "person.name.first" -> group "person"
+#
+# If you want stricter/custom grouping, specify it here.
+# Examples:
+#   "A": ["address", "issuer_info", "terms"]
+#   "B": ["person.name", "person.dob"]
+ROLLUP_GROUPS_BY_FOLDER = {
+    "A": None,
+    "B": None,
+    "C": None,
 }
 
 # optional normalization
@@ -123,6 +140,56 @@ def flatten_all_value_paths(obj: Any, parent_key: str = "") -> Dict[str, Any]:
 
 
 # =========================================================
+# ROLLUP GROUPING
+# =========================================================
+
+def infer_default_group(field_name: str) -> str:
+    """
+    Default grouping:
+      address.street -> address
+      person.name.first -> person
+      coupon -> coupon
+      legs.0.currency -> legs
+    """
+    return field_name.split(".")[0]
+
+
+def assign_group_for_field(
+    field_name: str,
+    configured_groups: Optional[List[str]]
+) -> str:
+    """
+    If configured_groups is provided, assign the most specific matching prefix.
+    Otherwise use the default top-level prefix.
+
+    Example:
+      field_name = "person.name.first"
+      configured_groups = ["person.name", "person.dob"]
+      -> returns "person.name"
+    """
+    if configured_groups:
+        matches = [
+            g for g in configured_groups
+            if field_name == g or field_name.startswith(g + ".")
+        ]
+        if matches:
+            return max(matches, key=len)
+
+    return infer_default_group(field_name)
+
+
+def build_group_to_fields(
+    field_names: List[str],
+    configured_groups: Optional[List[str]]
+) -> Dict[str, List[str]]:
+    group_to_fields = defaultdict(list)
+    for field in field_names:
+        group = assign_group_for_field(field, configured_groups)
+        group_to_fields[group].append(field)
+    return dict(group_to_fields)
+
+
+# =========================================================
 # BUILD ONE TABLE FOR ONE FOLDER
 # =========================================================
 
@@ -187,18 +254,19 @@ def build_folder_dataframe(
         for attr in all_attrs:
             gt_val = gt_flat.get(attr)
             pred_val = pred_flat.get(attr)
+            is_match = (gt_val == pred_val)
 
             row[f"{attr}_gt"] = gt_val
             row[f"{attr}_pred"] = pred_val
-            row[f"{attr}_match"] = (gt_val == pred_val)
+            row[f"{attr}_match"] = is_match
 
             total_fields += 1
-            if gt_val == pred_val:
+            if is_match:
                 matched_fields += 1
 
         row["matched_fields"] = matched_fields
         row["total_fields"] = total_fields
-        row["row_accuracy"] = matched_fields / total_fields if total_fields else None
+        row["child_accuracy"] = matched_fields / total_fields if total_fields else None
 
         rows.append(row)
 
@@ -223,14 +291,13 @@ def build_folder_dataframe(
     if df.empty:
         return df
 
-    # nice column ordering
     fixed_first = [
         "folder",
         "file",
         "status",
         "matched_fields",
         "total_fields",
-        "row_accuracy",
+        "child_accuracy",
     ]
     fixed_first = [c for c in fixed_first if c in df.columns]
 
@@ -258,6 +325,205 @@ def build_folder_dataframe(
     df = df.sort_values(["file"], na_position="last").reset_index(drop=True)
 
     return df
+
+
+# =========================================================
+# SUMMARY TABLES
+# =========================================================
+
+def build_summary_table(
+    tables_by_folder: Dict[str, pd.DataFrame],
+    rollup_groups_by_folder: Dict[str, Optional[List[str]]],
+) -> pd.DataFrame:
+    summary_rows = []
+
+    for folder_name, df in tables_by_folder.items():
+        if df.empty or "status" not in df.columns:
+            summary_rows.append({
+                "folder": folder_name,
+                "files_compared": 0,
+                "child_mode_accuracy": None,
+                "child_mode_exact_match_rate": None,
+                "rollup_mode_accuracy": None,
+                "rollup_mode_exact_match_rate": None,
+                "missing_in_gt": 0,
+                "missing_in_pred": 0,
+            })
+            continue
+
+        ok_df = df[df["status"] == "OK"].copy()
+        missing_in_gt = int((df["status"] == "Missing in ground truth").sum())
+        missing_in_pred = int((df["status"] == "Missing in prediction").sum())
+
+        if ok_df.empty:
+            summary_rows.append({
+                "folder": folder_name,
+                "files_compared": 0,
+                "child_mode_accuracy": None,
+                "child_mode_exact_match_rate": None,
+                "rollup_mode_accuracy": None,
+                "rollup_mode_exact_match_rate": None,
+                "missing_in_gt": missing_in_gt,
+                "missing_in_pred": missing_in_pred,
+            })
+            continue
+
+        # ---------- child mode ----------
+        files_compared = len(ok_df)
+        total_matched_children = int(ok_df["matched_fields"].sum())
+        total_children = int(ok_df["total_fields"].sum())
+        child_exact_matches = int((ok_df["matched_fields"] == ok_df["total_fields"]).sum())
+
+        child_mode_accuracy = (
+            total_matched_children / total_children if total_children else None
+        )
+        child_mode_exact_match_rate = (
+            child_exact_matches / files_compared if files_compared else None
+        )
+
+        # ---------- rollup mode ----------
+        configured_groups = rollup_groups_by_folder.get(folder_name)
+
+        match_cols = [c for c in ok_df.columns if c.endswith("_match")]
+        field_names = [c[:-6] for c in match_cols]
+        group_to_fields = build_group_to_fields(field_names, configured_groups)
+
+        total_groups_all_files = 0
+        matched_groups_all_files = 0
+        exact_rollup_files = 0
+
+        for _, row in ok_df.iterrows():
+            group_results = []
+
+            for group, fields in group_to_fields.items():
+                child_matches = [
+                    row.get(f"{field}_match")
+                    for field in fields
+                    if f"{field}_match" in row
+                ]
+
+                # child_matches should exist, but keep safe
+                if not child_matches:
+                    continue
+
+                # strict rollup: group only matches if all descendant children match
+                group_match = all(bool(x) for x in child_matches)
+                group_results.append(group_match)
+
+            total_groups = len(group_results)
+            matched_groups = sum(group_results)
+
+            total_groups_all_files += total_groups
+            matched_groups_all_files += matched_groups
+
+            if total_groups > 0 and matched_groups == total_groups:
+                exact_rollup_files += 1
+
+        rollup_mode_accuracy = (
+            matched_groups_all_files / total_groups_all_files
+            if total_groups_all_files else None
+        )
+        rollup_mode_exact_match_rate = (
+            exact_rollup_files / files_compared if files_compared else None
+        )
+
+        summary_rows.append({
+            "folder": folder_name,
+            "files_compared": files_compared,
+            "child_mode_accuracy": child_mode_accuracy,
+            "child_mode_exact_match_rate": child_mode_exact_match_rate,
+            "rollup_mode_accuracy": rollup_mode_accuracy,
+            "rollup_mode_exact_match_rate": rollup_mode_exact_match_rate,
+            "missing_in_gt": missing_in_gt,
+            "missing_in_pred": missing_in_pred,
+        })
+
+    return pd.DataFrame(summary_rows)
+
+
+def build_per_field_accuracy_table(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    For one folder dataframe, compute per-child-field accuracy.
+    Only uses rows with status == 'OK'.
+    """
+    if df.empty or "status" not in df.columns:
+        return pd.DataFrame(columns=["field", "matches", "total", "accuracy"])
+
+    ok_df = df[df["status"] == "OK"].copy()
+    if ok_df.empty:
+        return pd.DataFrame(columns=["field", "matches", "total", "accuracy"])
+
+    match_cols = [c for c in ok_df.columns if c.endswith("_match")]
+
+    rows = []
+    for col in match_cols:
+        field = col[:-6]
+        valid = ok_df[col].notna()
+        total = int(valid.sum())
+        matches = int(ok_df.loc[valid, col].sum()) if total else 0
+
+        rows.append({
+            "field": field,
+            "matches": matches,
+            "total": total,
+            "accuracy": (matches / total) if total else None,
+        })
+
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.sort_values(["accuracy", "field"], ascending=[True, True]).reset_index(drop=True)
+    return out
+
+
+def build_per_group_accuracy_table(
+    df: pd.DataFrame,
+    configured_groups: Optional[List[str]],
+) -> pd.DataFrame:
+    """
+    For one folder dataframe, compute rollup-group accuracy.
+    A group is correct only if all descendant child fields match.
+    """
+    if df.empty or "status" not in df.columns:
+        return pd.DataFrame(columns=["group", "matches", "total", "accuracy"])
+
+    ok_df = df[df["status"] == "OK"].copy()
+    if ok_df.empty:
+        return pd.DataFrame(columns=["group", "matches", "total", "accuracy"])
+
+    match_cols = [c for c in ok_df.columns if c.endswith("_match")]
+    field_names = [c[:-6] for c in match_cols]
+    group_to_fields = build_group_to_fields(field_names, configured_groups)
+
+    rows = []
+    for group, fields in sorted(group_to_fields.items()):
+        group_results = []
+
+        for _, row in ok_df.iterrows():
+            child_matches = [
+                row.get(f"{field}_match")
+                for field in fields
+                if f"{field}_match" in row
+            ]
+            if not child_matches:
+                continue
+
+            group_match = all(bool(x) for x in child_matches)
+            group_results.append(group_match)
+
+        total = len(group_results)
+        matches = sum(group_results)
+
+        rows.append({
+            "group": group,
+            "matches": int(matches),
+            "total": int(total),
+            "accuracy": (matches / total) if total else None,
+        })
+
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.sort_values(["accuracy", "group"], ascending=[True, True]).reset_index(drop=True)
+    return out
 
 
 # =========================================================
@@ -302,91 +568,6 @@ def build_all_tables(
 
 
 # =========================================================
-# SUMMARY TABLES
-# =========================================================
-
-def build_summary_table(tables_by_folder: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-    summary_rows = []
-
-    for folder_name, df in tables_by_folder.items():
-        if df.empty or "status" not in df.columns:
-            summary_rows.append({
-                "folder": folder_name,
-                "files_compared": 0,
-                "field_accuracy": None,
-                "exact_match_rate": None,
-                "missing_in_gt": 0,
-                "missing_in_pred": 0,
-            })
-            continue
-
-        ok_df = df[df["status"] == "OK"].copy()
-        missing_in_gt = (df["status"] == "Missing in ground truth").sum()
-        missing_in_pred = (df["status"] == "Missing in prediction").sum()
-
-        if ok_df.empty:
-            summary_rows.append({
-                "folder": folder_name,
-                "files_compared": 0,
-                "field_accuracy": None,
-                "exact_match_rate": None,
-                "missing_in_gt": int(missing_in_gt),
-                "missing_in_pred": int(missing_in_pred),
-            })
-            continue
-
-        exact_matches = (ok_df["matched_fields"] == ok_df["total_fields"]).sum()
-        files_compared = len(ok_df)
-        total_matched = ok_df["matched_fields"].sum()
-        total_fields = ok_df["total_fields"].sum()
-
-        summary_rows.append({
-            "folder": folder_name,
-            "files_compared": int(files_compared),
-            "field_accuracy": total_matched / total_fields if total_fields else None,
-            "exact_match_rate": exact_matches / files_compared if files_compared else None,
-            "missing_in_gt": int(missing_in_gt),
-            "missing_in_pred": int(missing_in_pred),
-        })
-
-    return pd.DataFrame(summary_rows)
-
-
-def build_per_field_accuracy_table(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    For one folder dataframe, compute per-attribute accuracy.
-    Only uses rows with status == 'OK'.
-    """
-    if df.empty or "status" not in df.columns:
-        return pd.DataFrame(columns=["field", "matches", "total", "accuracy"])
-
-    ok_df = df[df["status"] == "OK"].copy()
-    if ok_df.empty:
-        return pd.DataFrame(columns=["field", "matches", "total", "accuracy"])
-
-    match_cols = [c for c in ok_df.columns if c.endswith("_match")]
-
-    rows = []
-    for col in match_cols:
-        field = col[:-6]
-        valid = ok_df[col].notna()
-        total = valid.sum()
-        matches = ok_df.loc[valid, col].sum() if total else 0
-
-        rows.append({
-            "field": field,
-            "matches": int(matches),
-            "total": int(total),
-            "accuracy": (matches / total) if total else None,
-        })
-
-    out = pd.DataFrame(rows)
-    if not out.empty:
-        out = out.sort_values(["accuracy", "field"], ascending=[True, True]).reset_index(drop=True)
-    return out
-
-
-# =========================================================
 # MAIN
 # =========================================================
 
@@ -397,7 +578,10 @@ if __name__ == "__main__":
         routes_by_folder=ROUTES_BY_FOLDER,
     )
 
-    summary_df = build_summary_table(tables_by_folder)
+    summary_df = build_summary_table(
+        tables_by_folder=tables_by_folder,
+        rollup_groups_by_folder=ROLLUP_GROUPS_BY_FOLDER,
+    )
 
     # save one comparison table per folder
     for folder_name, df in tables_by_folder.items():
@@ -406,9 +590,17 @@ if __name__ == "__main__":
         print(f"Saved {out_csv}")
 
         per_field_df = build_per_field_accuracy_table(df)
-        per_field_csv = f"comparison_{folder_name}_field_accuracy.csv"
+        per_field_csv = f"comparison_{folder_name}_child_accuracy.csv"
         per_field_df.to_csv(per_field_csv, index=False)
         print(f"Saved {per_field_csv}")
+
+        per_group_df = build_per_group_accuracy_table(
+            df=df,
+            configured_groups=ROLLUP_GROUPS_BY_FOLDER.get(folder_name),
+        )
+        per_group_csv = f"comparison_{folder_name}_rollup_accuracy.csv"
+        per_group_df.to_csv(per_group_csv, index=False)
+        print(f"Saved {per_group_csv}")
 
     summary_df.to_csv("comparison_summary.csv", index=False)
     print("Saved comparison_summary.csv")
