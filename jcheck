@@ -1,6 +1,7 @@
 import json
+import math
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
 import pandas as pd
 
@@ -19,23 +20,23 @@ ROUTES_BY_FOLDER = {
     "C": "data.items",
 }
 
-# Rollup root per folder.
-# If None, rollup mode will use the top-most prefix of each flattened field.
-# Example:
-#   "address.street" -> group "address"
-#   "person.name.first" -> group "person"
-#
-# If you want stricter/custom grouping, specify it here.
-# Examples:
-#   "A": ["address", "issuer_info", "terms"]
-#   "B": ["person.name", "person.dob"]
+# Rollup groups per folder.
+# None = default top-level grouping
+# Example custom grouping:
+# "B": ["person.name", "person.dob", "address"]
 ROLLUP_GROUPS_BY_FOLDER = {
     "A": None,
     "B": None,
     "C": None,
 }
 
-# optional normalization
+# Thresholds for confidence sweep
+THRESHOLDS = [0, 50, 60, 70, 80, 90, 95]
+
+# If your confidence is between 0 and 1 instead of 0 and 100, set this True.
+CONFIDENCE_IS_PROBABILITY = False
+
+# normalization
 STRIP_STRINGS = True
 CASE_INSENSITIVE_STRINGS = False
 
@@ -60,7 +61,7 @@ def normalize_value(x: Any) -> Any:
 
 def get_by_route(obj: Any, route: str) -> Any:
     """
-    Supports dotted paths like:
+    Supports:
       a.b.c
       items.0.name
     Returns None if route does not exist.
@@ -87,54 +88,127 @@ def list_relative_jsons(folder: Path) -> List[Path]:
     return sorted([p.relative_to(folder) for p in folder.rglob("*.json")])
 
 
+def coerce_confidence(x: Any) -> Optional[float]:
+    """
+    Converts confidence to float when possible.
+    Returns None if missing/unusable.
+    """
+    if x is None:
+        return None
+    try:
+        val = float(x)
+    except Exception:
+        return None
+
+    if math.isnan(val):
+        return None
+
+    if CONFIDENCE_IS_PROBABILITY:
+        val = val * 100.0
+
+    return val
+
+
 # =========================================================
 # RECURSIVE FLATTENING
 # =========================================================
 
-def flatten_all_value_paths(obj: Any, parent_key: str = "") -> Dict[str, Any]:
+def flatten_prediction_value_paths(obj: Any, parent_key: str = "") -> Dict[str, Dict[str, Any]]:
     """
-    Recursively traverse obj and capture every key named 'value'.
+    Recursively walk prediction subtree.
+    Capture every dict that contains a key named 'value'.
 
-    Example input:
+    Output format:
     {
-        "entity_name": {"value": "Apple"},
-        "issuer_info": {
-            "name": {"value": "Apple Inc"},
-            "country": {"value": "US"}
+        "entity_name": {
+            "value": "Apple",
+            "confidence": 93.0,
+            "has_value": True,
+            "has_confidence": True
         },
-        "terms": {
-            "coupon": {"value": 4.5}
+        "issuer_info.name": {
+            "value": "Apple Inc",
+            "confidence": 88.0,
+            "has_value": True,
+            "has_confidence": True
+        },
+        "issuer_info.country": {
+            "value": None,
+            "confidence": None,
+            "has_value": False,
+            "has_confidence": False
         }
     }
 
-    Output:
-    {
-        "entity_name": "Apple",
-        "issuer_info.name": "Apple Inc",
-        "issuer_info.country": "US",
-        "terms.coupon": 4.5
-    }
-
     Notes:
-    - The actual 'value' leaf is recorded, but the output key drops the trailing '.value'
-    - Lists are supported via numeric path pieces, e.g. components.0.ticker
+    - path drops trailing '.value'
+    - confidence is taken from sibling "co-ords" -> "confidence" if present
+    - lists are supported
     """
     items = {}
 
     if isinstance(obj, dict):
-        for k, v in obj.items():
-            new_key = f"{parent_key}.{k}" if parent_key else k
+        # if this dict itself is a leaf containing "value", record it
+        if "value" in obj:
+            clean_key = parent_key if parent_key else "value"
+            raw_value = obj.get("value")
+            coords = obj.get("co-ords")
 
+            confidence = None
+            if isinstance(coords, dict):
+                confidence = coerce_confidence(coords.get("confidence"))
+
+            items[clean_key] = {
+                "value": normalize_value(raw_value),
+                "confidence": confidence,
+                "has_value": raw_value is not None,
+                "has_confidence": confidence is not None,
+            }
+
+        # continue recursion for descendants too
+        for k, v in obj.items():
             if k == "value":
-                clean_key = parent_key if parent_key else "value"
-                items[clean_key] = normalize_value(v)
-            else:
-                items.update(flatten_all_value_paths(v, new_key))
+                continue
+            new_key = f"{parent_key}.{k}" if parent_key else k
+            items.update(flatten_prediction_value_paths(v, new_key))
 
     elif isinstance(obj, list):
         for i, v in enumerate(obj):
             new_key = f"{parent_key}.{i}" if parent_key else str(i)
-            items.update(flatten_all_value_paths(v, new_key))
+            items.update(flatten_prediction_value_paths(v, new_key))
+
+    return items
+
+
+def flatten_gt_value_paths(obj: Any, parent_key: str = "") -> Dict[str, Any]:
+    """
+    Recursively walk GT subtree.
+    Capture every dict that contains a key named 'value'.
+
+    Output format:
+    {
+        "entity_name": "Apple",
+        "issuer_info.name": "Apple Inc",
+        "issuer_info.country": "US"
+    }
+    """
+    items = {}
+
+    if isinstance(obj, dict):
+        if "value" in obj:
+            clean_key = parent_key if parent_key else "value"
+            items[clean_key] = normalize_value(obj.get("value"))
+
+        for k, v in obj.items():
+            if k == "value":
+                continue
+            new_key = f"{parent_key}.{k}" if parent_key else k
+            items.update(flatten_gt_value_paths(v, new_key))
+
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            new_key = f"{parent_key}.{i}" if parent_key else str(i)
+            items.update(flatten_gt_value_paths(v, new_key))
 
     return items
 
@@ -160,12 +234,7 @@ def assign_group_for_field(
 ) -> str:
     """
     If configured_groups is provided, assign the most specific matching prefix.
-    Otherwise use the default top-level prefix.
-
-    Example:
-      field_name = "person.name.first"
-      configured_groups = ["person.name", "person.dob"]
-      -> returns "person.name"
+    Otherwise use top-level prefix.
     """
     if configured_groups:
         matches = [
@@ -190,6 +259,228 @@ def build_group_to_fields(
 
 
 # =========================================================
+# EVALUATION HELPERS
+# =========================================================
+
+def classify_prediction_status(
+    pred_info: Optional[Dict[str, Any]],
+    threshold: float
+) -> str:
+    """
+    Returns one of:
+      - missing_pred
+      - null_or_ignored
+      - missing_confidence
+      - low_conf
+      - evaluated
+    """
+    if pred_info is None:
+        return "missing_pred"
+
+    if not pred_info.get("has_value", False):
+        return "null_or_ignored"
+
+    confidence = pred_info.get("confidence")
+    has_confidence = pred_info.get("has_confidence", False)
+
+    if not has_confidence or confidence is None:
+        return "missing_confidence"
+
+    if confidence < threshold:
+        return "low_conf"
+
+    return "evaluated"
+
+
+def evaluate_child_mode_for_file(
+    gt_flat: Dict[str, Any],
+    pred_flat: Dict[str, Dict[str, Any]],
+    threshold: float
+) -> Dict[str, Any]:
+    """
+    Child mode:
+    - every child field is an independent item
+    - only evaluated predictions count in accuracy
+    - null/ignored/missing_confidence/low_conf are abstentions
+    """
+    all_fields = sorted(set(gt_flat.keys()) | set(pred_flat.keys()))
+
+    total_fields = len(all_fields)
+    evaluated_fields = 0
+    correct_evaluated_fields = 0
+    low_conf_correct = 0
+    low_conf_total = 0
+    missing_conf_correct = 0
+    missing_conf_total = 0
+    null_or_ignored_count = 0
+    missing_pred_count = 0
+
+    per_field = {}
+
+    for field in all_fields:
+        gt_val = gt_flat.get(field)
+        pred_info = pred_flat.get(field)
+        pred_val = pred_info["value"] if pred_info is not None else None
+        confidence = pred_info["confidence"] if pred_info is not None else None
+
+        status = classify_prediction_status(pred_info, threshold)
+
+        is_match = None
+        if pred_info is not None and pred_info.get("has_value", False):
+            is_match = (pred_val == gt_val)
+
+        if status == "evaluated":
+            evaluated_fields += 1
+            if is_match:
+                correct_evaluated_fields += 1
+        elif status == "low_conf":
+            low_conf_total += 1
+            if is_match:
+                low_conf_correct += 1
+        elif status == "missing_confidence":
+            missing_conf_total += 1
+            if is_match:
+                missing_conf_correct += 1
+        elif status == "null_or_ignored":
+            null_or_ignored_count += 1
+        elif status == "missing_pred":
+            missing_pred_count += 1
+
+        per_field[field] = {
+            "gt_value": gt_val,
+            "pred_value": pred_val,
+            "pred_confidence": confidence,
+            "status": status,
+            "match_if_predicted": is_match,
+        }
+
+    coverage = evaluated_fields / total_fields if total_fields else None
+    accuracy = correct_evaluated_fields / evaluated_fields if evaluated_fields else None
+    overall_retained_correct_rate = correct_evaluated_fields / total_fields if total_fields else None
+    low_conf_correct_rate = low_conf_correct / low_conf_total if low_conf_total else None
+    missing_conf_correct_rate = missing_conf_correct / missing_conf_total if missing_conf_total else None
+
+    return {
+        "total_fields": total_fields,
+        "evaluated_fields": evaluated_fields,
+        "correct_evaluated_fields": correct_evaluated_fields,
+        "coverage": coverage,
+        "accuracy": accuracy,
+        "overall_retained_correct_rate": overall_retained_correct_rate,
+        "low_conf_total": low_conf_total,
+        "low_conf_correct": low_conf_correct,
+        "low_conf_correct_rate": low_conf_correct_rate,
+        "missing_conf_total": missing_conf_total,
+        "missing_conf_correct": missing_conf_correct,
+        "missing_conf_correct_rate": missing_conf_correct_rate,
+        "null_or_ignored_count": null_or_ignored_count,
+        "missing_pred_count": missing_pred_count,
+        "per_field": per_field,
+    }
+
+
+def evaluate_rollup_mode_for_file(
+    gt_flat: Dict[str, Any],
+    pred_flat: Dict[str, Dict[str, Any]],
+    threshold: float,
+    configured_groups: Optional[List[str]],
+) -> Dict[str, Any]:
+    """
+    Rollup mode:
+    - same child table underneath
+    - groups are scored strictly:
+      a group is correct only if ALL of its child fields are evaluated and correct
+    - if any child is low_conf / missing_conf / null / missing -> group fails to count as correct
+    """
+    all_fields = sorted(set(gt_flat.keys()) | set(pred_flat.keys()))
+    group_to_fields = build_group_to_fields(all_fields, configured_groups)
+
+    total_groups = 0
+    covered_groups = 0
+    correct_covered_groups = 0
+    low_conf_but_correct_groups = 0
+    low_conf_or_incomplete_groups = 0
+
+    per_group = {}
+
+    for group, fields in sorted(group_to_fields.items()):
+        total_groups += 1
+
+        field_results = []
+        for field in fields:
+            gt_val = gt_flat.get(field)
+            pred_info = pred_flat.get(field)
+            pred_val = pred_info["value"] if pred_info is not None else None
+            status = classify_prediction_status(pred_info, threshold)
+
+            is_match = None
+            if pred_info is not None and pred_info.get("has_value", False):
+                is_match = (pred_val == gt_val)
+
+            field_results.append({
+                "field": field,
+                "status": status,
+                "is_match": is_match,
+            })
+
+        all_evaluated = all(fr["status"] == "evaluated" for fr in field_results)
+        all_evaluated_and_correct = all(
+            fr["status"] == "evaluated" and fr["is_match"] is True
+            for fr in field_results
+        )
+
+        # covered group means every child is evaluated
+        group_covered = all_evaluated
+        group_match = all_evaluated_and_correct
+
+        if group_covered:
+            covered_groups += 1
+            if group_match:
+                correct_covered_groups += 1
+        else:
+            low_conf_or_incomplete_groups += 1
+
+            # Optional underconfidence/incomplete insight:
+            # group would have been correct if all child fields with actual predictions were correct
+            # and the only blockers were abstentions / low confidence / missing confidence
+            all_predicted_children_correct = True
+            any_blocker = False
+
+            for fr in field_results:
+                if fr["status"] in {"low_conf", "missing_confidence", "null_or_ignored", "missing_pred"}:
+                    any_blocker = True
+                elif fr["status"] == "evaluated":
+                    if fr["is_match"] is not True:
+                        all_predicted_children_correct = False
+
+            if any_blocker and all_predicted_children_correct:
+                low_conf_but_correct_groups += 1
+
+        per_group[group] = {
+            "group_covered": group_covered,
+            "group_match": group_match,
+            "num_fields": len(fields),
+            "fields": [fr["field"] for fr in field_results],
+        }
+
+    coverage = covered_groups / total_groups if total_groups else None
+    accuracy = correct_covered_groups / covered_groups if covered_groups else None
+    overall_retained_correct_rate = correct_covered_groups / total_groups if total_groups else None
+
+    return {
+        "total_groups": total_groups,
+        "covered_groups": covered_groups,
+        "correct_covered_groups": correct_covered_groups,
+        "coverage": coverage,
+        "accuracy": accuracy,
+        "overall_retained_correct_rate": overall_retained_correct_rate,
+        "low_conf_or_incomplete_groups": low_conf_or_incomplete_groups,
+        "low_conf_but_correct_groups": low_conf_but_correct_groups,
+        "per_group": per_group,
+    }
+
+
+# =========================================================
 # BUILD ONE TABLE FOR ONE FOLDER
 # =========================================================
 
@@ -198,6 +489,7 @@ def build_folder_dataframe(
     result_folder: Path,
     gt_folder: Path,
     route: str,
+    default_threshold: float = 80,
 ) -> pd.DataFrame:
     result_files = set(list_relative_jsons(result_folder))
     gt_files = set(list_relative_jsons(gt_folder))
@@ -205,7 +497,6 @@ def build_folder_dataframe(
 
     rows = []
 
-    # matched files
     for rel_path in common_files:
         pred_path = result_folder / rel_path
         gt_path = gt_folder / rel_path
@@ -243,34 +534,37 @@ def build_folder_dataframe(
             rows.append(row)
             continue
 
-        pred_flat = flatten_all_value_paths(pred_subtree)
-        gt_flat = flatten_all_value_paths(gt_subtree)
+        pred_flat = flatten_prediction_value_paths(pred_subtree)
+        gt_flat = flatten_gt_value_paths(gt_subtree)
 
-        all_attrs = sorted(set(pred_flat.keys()) | set(gt_flat.keys()))
+        all_fields = sorted(set(gt_flat.keys()) | set(pred_flat.keys()))
+        child_eval = evaluate_child_mode_for_file(gt_flat, pred_flat, threshold=default_threshold)
 
-        matched_fields = 0
-        total_fields = 0
+        for field in all_fields:
+            field_res = child_eval["per_field"][field]
+            row[f"{field}_gt"] = field_res["gt_value"]
+            row[f"{field}_pred"] = field_res["pred_value"]
+            row[f"{field}_confidence"] = field_res["pred_confidence"]
+            row[f"{field}_eval_status"] = field_res["status"]
+            row[f"{field}_match_if_predicted"] = field_res["match_if_predicted"]
 
-        for attr in all_attrs:
-            gt_val = gt_flat.get(attr)
-            pred_val = pred_flat.get(attr)
-            is_match = (gt_val == pred_val)
-
-            row[f"{attr}_gt"] = gt_val
-            row[f"{attr}_pred"] = pred_val
-            row[f"{attr}_match"] = is_match
-
-            total_fields += 1
-            if is_match:
-                matched_fields += 1
-
-        row["matched_fields"] = matched_fields
-        row["total_fields"] = total_fields
-        row["child_accuracy"] = matched_fields / total_fields if total_fields else None
+        row["total_fields"] = child_eval["total_fields"]
+        row["evaluated_fields"] = child_eval["evaluated_fields"]
+        row["correct_evaluated_fields"] = child_eval["correct_evaluated_fields"]
+        row["coverage_at_default_threshold"] = child_eval["coverage"]
+        row["accuracy_at_default_threshold"] = child_eval["accuracy"]
+        row["overall_retained_correct_rate_at_default_threshold"] = child_eval["overall_retained_correct_rate"]
+        row["low_conf_total_at_default_threshold"] = child_eval["low_conf_total"]
+        row["low_conf_correct_at_default_threshold"] = child_eval["low_conf_correct"]
+        row["low_conf_correct_rate_at_default_threshold"] = child_eval["low_conf_correct_rate"]
+        row["missing_conf_total_at_default_threshold"] = child_eval["missing_conf_total"]
+        row["missing_conf_correct_at_default_threshold"] = child_eval["missing_conf_correct"]
+        row["missing_conf_correct_rate_at_default_threshold"] = child_eval["missing_conf_correct_rate"]
+        row["null_or_ignored_count"] = child_eval["null_or_ignored_count"]
+        row["missing_pred_count"] = child_eval["missing_pred_count"]
 
         rows.append(row)
 
-    # missing in GT
     for rel_path in sorted(result_files - gt_files):
         rows.append({
             "folder": folder_name,
@@ -278,7 +572,6 @@ def build_folder_dataframe(
             "status": "Missing in ground truth",
         })
 
-    # missing in prediction
     for rel_path in sorted(gt_files - result_files):
         rows.append({
             "folder": folder_name,
@@ -295,9 +588,20 @@ def build_folder_dataframe(
         "folder",
         "file",
         "status",
-        "matched_fields",
         "total_fields",
-        "child_accuracy",
+        "evaluated_fields",
+        "correct_evaluated_fields",
+        "coverage_at_default_threshold",
+        "accuracy_at_default_threshold",
+        "overall_retained_correct_rate_at_default_threshold",
+        "low_conf_total_at_default_threshold",
+        "low_conf_correct_at_default_threshold",
+        "low_conf_correct_rate_at_default_threshold",
+        "missing_conf_total_at_default_threshold",
+        "missing_conf_correct_at_default_threshold",
+        "missing_conf_correct_rate_at_default_threshold",
+        "null_or_ignored_count",
+        "missing_pred_count",
     ]
     fixed_first = [c for c in fixed_first if c in df.columns]
 
@@ -306,224 +610,25 @@ def build_folder_dataframe(
     } | {
         c[:-5] for c in df.columns if c.endswith("_pred")
     } | {
-        c[:-6] for c in df.columns if c.endswith("_match")
+        c[:-11] for c in df.columns if c.endswith("_confidence")
+    } | {
+        c[:-12] for c in df.columns if c.endswith("_eval_status")
+    } | {
+        c[:-19] for c in df.columns if c.endswith("_match_if_predicted")
     })
 
     paired_cols = []
     for base in attr_bases:
-        for suffix in ["_gt", "_pred", "_match"]:
+        for suffix in ["_gt", "_pred", "_confidence", "_eval_status", "_match_if_predicted"]:
             col = f"{base}{suffix}"
             if col in df.columns and col not in fixed_first:
                 paired_cols.append(col)
 
-    remaining_cols = [
-        c for c in df.columns
-        if c not in fixed_first and c not in paired_cols
-    ]
-
+    remaining_cols = [c for c in df.columns if c not in fixed_first and c not in paired_cols]
     df = df[fixed_first + paired_cols + remaining_cols]
     df = df.sort_values(["file"], na_position="last").reset_index(drop=True)
 
     return df
-
-
-# =========================================================
-# SUMMARY TABLES
-# =========================================================
-
-def build_summary_table(
-    tables_by_folder: Dict[str, pd.DataFrame],
-    rollup_groups_by_folder: Dict[str, Optional[List[str]]],
-) -> pd.DataFrame:
-    summary_rows = []
-
-    for folder_name, df in tables_by_folder.items():
-        if df.empty or "status" not in df.columns:
-            summary_rows.append({
-                "folder": folder_name,
-                "files_compared": 0,
-                "child_mode_accuracy": None,
-                "child_mode_exact_match_rate": None,
-                "rollup_mode_accuracy": None,
-                "rollup_mode_exact_match_rate": None,
-                "missing_in_gt": 0,
-                "missing_in_pred": 0,
-            })
-            continue
-
-        ok_df = df[df["status"] == "OK"].copy()
-        missing_in_gt = int((df["status"] == "Missing in ground truth").sum())
-        missing_in_pred = int((df["status"] == "Missing in prediction").sum())
-
-        if ok_df.empty:
-            summary_rows.append({
-                "folder": folder_name,
-                "files_compared": 0,
-                "child_mode_accuracy": None,
-                "child_mode_exact_match_rate": None,
-                "rollup_mode_accuracy": None,
-                "rollup_mode_exact_match_rate": None,
-                "missing_in_gt": missing_in_gt,
-                "missing_in_pred": missing_in_pred,
-            })
-            continue
-
-        # ---------- child mode ----------
-        files_compared = len(ok_df)
-        total_matched_children = int(ok_df["matched_fields"].sum())
-        total_children = int(ok_df["total_fields"].sum())
-        child_exact_matches = int((ok_df["matched_fields"] == ok_df["total_fields"]).sum())
-
-        child_mode_accuracy = (
-            total_matched_children / total_children if total_children else None
-        )
-        child_mode_exact_match_rate = (
-            child_exact_matches / files_compared if files_compared else None
-        )
-
-        # ---------- rollup mode ----------
-        configured_groups = rollup_groups_by_folder.get(folder_name)
-
-        match_cols = [c for c in ok_df.columns if c.endswith("_match")]
-        field_names = [c[:-6] for c in match_cols]
-        group_to_fields = build_group_to_fields(field_names, configured_groups)
-
-        total_groups_all_files = 0
-        matched_groups_all_files = 0
-        exact_rollup_files = 0
-
-        for _, row in ok_df.iterrows():
-            group_results = []
-
-            for group, fields in group_to_fields.items():
-                child_matches = [
-                    row.get(f"{field}_match")
-                    for field in fields
-                    if f"{field}_match" in row
-                ]
-
-                # child_matches should exist, but keep safe
-                if not child_matches:
-                    continue
-
-                # strict rollup: group only matches if all descendant children match
-                group_match = all(bool(x) for x in child_matches)
-                group_results.append(group_match)
-
-            total_groups = len(group_results)
-            matched_groups = sum(group_results)
-
-            total_groups_all_files += total_groups
-            matched_groups_all_files += matched_groups
-
-            if total_groups > 0 and matched_groups == total_groups:
-                exact_rollup_files += 1
-
-        rollup_mode_accuracy = (
-            matched_groups_all_files / total_groups_all_files
-            if total_groups_all_files else None
-        )
-        rollup_mode_exact_match_rate = (
-            exact_rollup_files / files_compared if files_compared else None
-        )
-
-        summary_rows.append({
-            "folder": folder_name,
-            "files_compared": files_compared,
-            "child_mode_accuracy": child_mode_accuracy,
-            "child_mode_exact_match_rate": child_mode_exact_match_rate,
-            "rollup_mode_accuracy": rollup_mode_accuracy,
-            "rollup_mode_exact_match_rate": rollup_mode_exact_match_rate,
-            "missing_in_gt": missing_in_gt,
-            "missing_in_pred": missing_in_pred,
-        })
-
-    return pd.DataFrame(summary_rows)
-
-
-def build_per_field_accuracy_table(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    For one folder dataframe, compute per-child-field accuracy.
-    Only uses rows with status == 'OK'.
-    """
-    if df.empty or "status" not in df.columns:
-        return pd.DataFrame(columns=["field", "matches", "total", "accuracy"])
-
-    ok_df = df[df["status"] == "OK"].copy()
-    if ok_df.empty:
-        return pd.DataFrame(columns=["field", "matches", "total", "accuracy"])
-
-    match_cols = [c for c in ok_df.columns if c.endswith("_match")]
-
-    rows = []
-    for col in match_cols:
-        field = col[:-6]
-        valid = ok_df[col].notna()
-        total = int(valid.sum())
-        matches = int(ok_df.loc[valid, col].sum()) if total else 0
-
-        rows.append({
-            "field": field,
-            "matches": matches,
-            "total": total,
-            "accuracy": (matches / total) if total else None,
-        })
-
-    out = pd.DataFrame(rows)
-    if not out.empty:
-        out = out.sort_values(["accuracy", "field"], ascending=[True, True]).reset_index(drop=True)
-    return out
-
-
-def build_per_group_accuracy_table(
-    df: pd.DataFrame,
-    configured_groups: Optional[List[str]],
-) -> pd.DataFrame:
-    """
-    For one folder dataframe, compute rollup-group accuracy.
-    A group is correct only if all descendant child fields match.
-    """
-    if df.empty or "status" not in df.columns:
-        return pd.DataFrame(columns=["group", "matches", "total", "accuracy"])
-
-    ok_df = df[df["status"] == "OK"].copy()
-    if ok_df.empty:
-        return pd.DataFrame(columns=["group", "matches", "total", "accuracy"])
-
-    match_cols = [c for c in ok_df.columns if c.endswith("_match")]
-    field_names = [c[:-6] for c in match_cols]
-    group_to_fields = build_group_to_fields(field_names, configured_groups)
-
-    rows = []
-    for group, fields in sorted(group_to_fields.items()):
-        group_results = []
-
-        for _, row in ok_df.iterrows():
-            child_matches = [
-                row.get(f"{field}_match")
-                for field in fields
-                if f"{field}_match" in row
-            ]
-            if not child_matches:
-                continue
-
-            group_match = all(bool(x) for x in child_matches)
-            group_results.append(group_match)
-
-        total = len(group_results)
-        matches = sum(group_results)
-
-        rows.append({
-            "group": group,
-            "matches": int(matches),
-            "total": int(total),
-            "accuracy": (matches / total) if total else None,
-        })
-
-    out = pd.DataFrame(rows)
-    if not out.empty:
-        out = out.sort_values(["accuracy", "group"], ascending=[True, True]).reset_index(drop=True)
-    return out
 
 
 # =========================================================
@@ -534,6 +639,7 @@ def build_all_tables(
     results_root: Path,
     gt_root: Path,
     routes_by_folder: Dict[str, str],
+    default_threshold: float = 80,
 ) -> Dict[str, pd.DataFrame]:
     tables_by_folder: Dict[str, pd.DataFrame] = {}
 
@@ -562,9 +668,364 @@ def build_all_tables(
             result_folder=result_folder,
             gt_folder=gt_folder,
             route=route,
+            default_threshold=default_threshold,
         )
 
     return tables_by_folder
+
+
+# =========================================================
+# SUMMARY / THRESHOLD ANALYSIS
+# =========================================================
+
+def summarize_folder_at_threshold(
+    folder_name: str,
+    result_folder: Path,
+    gt_folder: Path,
+    route: str,
+    threshold: float,
+    configured_groups: Optional[List[str]],
+) -> Dict[str, Any]:
+    result_files = set(list_relative_jsons(result_folder))
+    gt_files = set(list_relative_jsons(gt_folder))
+    common_files = sorted(result_files & gt_files)
+
+    child_total_fields = 0
+    child_evaluated_fields = 0
+    child_correct_evaluated_fields = 0
+    child_low_conf_total = 0
+    child_low_conf_correct = 0
+    child_missing_conf_total = 0
+    child_missing_conf_correct = 0
+    child_null_or_ignored_count = 0
+    child_missing_pred_count = 0
+
+    rollup_total_groups = 0
+    rollup_covered_groups = 0
+    rollup_correct_covered_groups = 0
+    rollup_low_conf_or_incomplete_groups = 0
+    rollup_low_conf_but_correct_groups = 0
+
+    child_exact_file_matches = 0
+    rollup_exact_file_matches = 0
+    ok_files = 0
+
+    for rel_path in common_files:
+        pred_path = result_folder / rel_path
+        gt_path = gt_folder / rel_path
+
+        try:
+            pred_json = load_json(pred_path)
+            gt_json = load_json(gt_path)
+        except Exception:
+            continue
+
+        pred_subtree = get_by_route(pred_json, route)
+        gt_subtree = get_by_route(gt_json, route)
+        if pred_subtree is None or gt_subtree is None:
+            continue
+
+        pred_flat = flatten_prediction_value_paths(pred_subtree)
+        gt_flat = flatten_gt_value_paths(gt_subtree)
+
+        child_eval = evaluate_child_mode_for_file(gt_flat, pred_flat, threshold)
+        rollup_eval = evaluate_rollup_mode_for_file(gt_flat, pred_flat, threshold, configured_groups)
+
+        ok_files += 1
+
+        child_total_fields += child_eval["total_fields"]
+        child_evaluated_fields += child_eval["evaluated_fields"]
+        child_correct_evaluated_fields += child_eval["correct_evaluated_fields"]
+        child_low_conf_total += child_eval["low_conf_total"]
+        child_low_conf_correct += child_eval["low_conf_correct"]
+        child_missing_conf_total += child_eval["missing_conf_total"]
+        child_missing_conf_correct += child_eval["missing_conf_correct"]
+        child_null_or_ignored_count += child_eval["null_or_ignored_count"]
+        child_missing_pred_count += child_eval["missing_pred_count"]
+
+        rollup_total_groups += rollup_eval["total_groups"]
+        rollup_covered_groups += rollup_eval["covered_groups"]
+        rollup_correct_covered_groups += rollup_eval["correct_covered_groups"]
+        rollup_low_conf_or_incomplete_groups += rollup_eval["low_conf_or_incomplete_groups"]
+        rollup_low_conf_but_correct_groups += rollup_eval["low_conf_but_correct_groups"]
+
+        if child_eval["evaluated_fields"] == child_eval["total_fields"] and \
+           child_eval["correct_evaluated_fields"] == child_eval["total_fields"]:
+            child_exact_file_matches += 1
+
+        if rollup_eval["covered_groups"] == rollup_eval["total_groups"] and \
+           rollup_eval["correct_covered_groups"] == rollup_eval["total_groups"]:
+            rollup_exact_file_matches += 1
+
+    child_coverage = child_evaluated_fields / child_total_fields if child_total_fields else None
+    child_accuracy = child_correct_evaluated_fields / child_evaluated_fields if child_evaluated_fields else None
+    child_overall_retained_correct_rate = child_correct_evaluated_fields / child_total_fields if child_total_fields else None
+    child_low_conf_correct_rate = child_low_conf_correct / child_low_conf_total if child_low_conf_total else None
+    child_missing_conf_correct_rate = child_missing_conf_correct / child_missing_conf_total if child_missing_conf_total else None
+    child_exact_match_rate = child_exact_file_matches / ok_files if ok_files else None
+
+    rollup_coverage = rollup_covered_groups / rollup_total_groups if rollup_total_groups else None
+    rollup_accuracy = rollup_correct_covered_groups / rollup_covered_groups if rollup_covered_groups else None
+    rollup_overall_retained_correct_rate = rollup_correct_covered_groups / rollup_total_groups if rollup_total_groups else None
+    rollup_exact_match_rate = rollup_exact_file_matches / ok_files if ok_files else None
+
+    return {
+        "folder": folder_name,
+        "threshold": threshold,
+        "files_compared": ok_files,
+
+        "child_total_fields": child_total_fields,
+        "child_evaluated_fields": child_evaluated_fields,
+        "child_correct_evaluated_fields": child_correct_evaluated_fields,
+        "child_coverage": child_coverage,
+        "child_accuracy": child_accuracy,
+        "child_overall_retained_correct_rate": child_overall_retained_correct_rate,
+        "child_low_conf_total": child_low_conf_total,
+        "child_low_conf_correct": child_low_conf_correct,
+        "child_low_conf_correct_rate": child_low_conf_correct_rate,
+        "child_missing_conf_total": child_missing_conf_total,
+        "child_missing_conf_correct": child_missing_conf_correct,
+        "child_missing_conf_correct_rate": child_missing_conf_correct_rate,
+        "child_null_or_ignored_count": child_null_or_ignored_count,
+        "child_missing_pred_count": child_missing_pred_count,
+        "child_exact_match_rate": child_exact_match_rate,
+
+        "rollup_total_groups": rollup_total_groups,
+        "rollup_covered_groups": rollup_covered_groups,
+        "rollup_correct_covered_groups": rollup_correct_covered_groups,
+        "rollup_coverage": rollup_coverage,
+        "rollup_accuracy": rollup_accuracy,
+        "rollup_overall_retained_correct_rate": rollup_overall_retained_correct_rate,
+        "rollup_low_conf_or_incomplete_groups": rollup_low_conf_or_incomplete_groups,
+        "rollup_low_conf_but_correct_groups": rollup_low_conf_but_correct_groups,
+        "rollup_exact_match_rate": rollup_exact_match_rate,
+    }
+
+
+def build_threshold_sweep_table(
+    results_root: Path,
+    gt_root: Path,
+    routes_by_folder: Dict[str, str],
+    rollup_groups_by_folder: Dict[str, Optional[List[str]]],
+    thresholds: List[float],
+) -> pd.DataFrame:
+    rows = []
+
+    for folder_name, route in routes_by_folder.items():
+        result_folder = results_root / folder_name
+        gt_folder = gt_root / folder_name
+
+        if not result_folder.exists() or not gt_folder.exists():
+            continue
+
+        configured_groups = rollup_groups_by_folder.get(folder_name)
+
+        for threshold in thresholds:
+            row = summarize_folder_at_threshold(
+                folder_name=folder_name,
+                result_folder=result_folder,
+                gt_folder=gt_folder,
+                route=route,
+                threshold=threshold,
+                configured_groups=configured_groups,
+            )
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def build_per_field_threshold_table(
+    folder_name: str,
+    result_folder: Path,
+    gt_folder: Path,
+    route: str,
+    thresholds: List[float],
+) -> pd.DataFrame:
+    """
+    For one folder, compute threshold-varying child-level coverage/accuracy per field.
+    """
+    result_files = set(list_relative_jsons(result_folder))
+    gt_files = set(list_relative_jsons(gt_folder))
+    common_files = sorted(result_files & gt_files)
+
+    prepared = []
+    for rel_path in common_files:
+        try:
+            pred_json = load_json(result_folder / rel_path)
+            gt_json = load_json(gt_folder / rel_path)
+        except Exception:
+            continue
+
+        pred_subtree = get_by_route(pred_json, route)
+        gt_subtree = get_by_route(gt_json, route)
+        if pred_subtree is None or gt_subtree is None:
+            continue
+
+        pred_flat = flatten_prediction_value_paths(pred_subtree)
+        gt_flat = flatten_gt_value_paths(gt_subtree)
+        prepared.append((str(rel_path), gt_flat, pred_flat))
+
+    all_fields = sorted(set().union(*[
+        set(gt_flat.keys()) | set(pred_flat.keys())
+        for _, gt_flat, pred_flat in prepared
+    ])) if prepared else []
+
+    rows = []
+    for threshold in thresholds:
+        for field in all_fields:
+            total = 0
+            evaluated = 0
+            correct_eval = 0
+            low_conf_total = 0
+            low_conf_correct = 0
+            null_or_ignored = 0
+            missing_conf = 0
+
+            for _, gt_flat, pred_flat in prepared:
+                total += 1
+                gt_val = gt_flat.get(field)
+                pred_info = pred_flat.get(field)
+                status = classify_prediction_status(pred_info, threshold)
+
+                pred_val = pred_info["value"] if pred_info is not None else None
+                is_match = None
+                if pred_info is not None and pred_info.get("has_value", False):
+                    is_match = (pred_val == gt_val)
+
+                if status == "evaluated":
+                    evaluated += 1
+                    if is_match:
+                        correct_eval += 1
+                elif status == "low_conf":
+                    low_conf_total += 1
+                    if is_match:
+                        low_conf_correct += 1
+                elif status == "null_or_ignored":
+                    null_or_ignored += 1
+                elif status == "missing_confidence":
+                    missing_conf += 1
+
+            rows.append({
+                "folder": folder_name,
+                "field": field,
+                "threshold": threshold,
+                "total": total,
+                "evaluated": evaluated,
+                "correct_evaluated": correct_eval,
+                "coverage": (evaluated / total) if total else None,
+                "accuracy": (correct_eval / evaluated) if evaluated else None,
+                "low_conf_total": low_conf_total,
+                "low_conf_correct": low_conf_correct,
+                "low_conf_correct_rate": (low_conf_correct / low_conf_total) if low_conf_total else None,
+                "null_or_ignored": null_or_ignored,
+                "missing_confidence": missing_conf,
+            })
+
+    return pd.DataFrame(rows)
+
+
+def build_per_group_threshold_table(
+    folder_name: str,
+    result_folder: Path,
+    gt_folder: Path,
+    route: str,
+    configured_groups: Optional[List[str]],
+    thresholds: List[float],
+) -> pd.DataFrame:
+    """
+    For one folder, compute threshold-varying rollup-level coverage/accuracy per group.
+    """
+    result_files = set(list_relative_jsons(result_folder))
+    gt_files = set(list_relative_jsons(gt_folder))
+    common_files = sorted(result_files & gt_files)
+
+    prepared = []
+    for rel_path in common_files:
+        try:
+            pred_json = load_json(result_folder / rel_path)
+            gt_json = load_json(gt_folder / rel_path)
+        except Exception:
+            continue
+
+        pred_subtree = get_by_route(pred_json, route)
+        gt_subtree = get_by_route(gt_json, route)
+        if pred_subtree is None or gt_subtree is None:
+            continue
+
+        pred_flat = flatten_prediction_value_paths(pred_subtree)
+        gt_flat = flatten_gt_value_paths(gt_subtree)
+        prepared.append((str(rel_path), gt_flat, pred_flat))
+
+    all_fields = sorted(set().union(*[
+        set(gt_flat.keys()) | set(pred_flat.keys())
+        for _, gt_flat, pred_flat in prepared
+    ])) if prepared else []
+
+    group_to_fields = build_group_to_fields(all_fields, configured_groups)
+
+    rows = []
+    for threshold in thresholds:
+        for group, fields in sorted(group_to_fields.items()):
+            total = 0
+            covered = 0
+            correct_covered = 0
+            low_conf_or_incomplete = 0
+            low_conf_but_correct = 0
+
+            for _, gt_flat, pred_flat in prepared:
+                total += 1
+
+                field_results = []
+                for field in fields:
+                    gt_val = gt_flat.get(field)
+                    pred_info = pred_flat.get(field)
+                    pred_val = pred_info["value"] if pred_info is not None else None
+                    status = classify_prediction_status(pred_info, threshold)
+
+                    is_match = None
+                    if pred_info is not None and pred_info.get("has_value", False):
+                        is_match = (pred_val == gt_val)
+
+                    field_results.append((status, is_match))
+
+                all_evaluated = all(status == "evaluated" for status, _ in field_results)
+                all_evaluated_and_correct = all(
+                    status == "evaluated" and is_match is True
+                    for status, is_match in field_results
+                )
+
+                if all_evaluated:
+                    covered += 1
+                    if all_evaluated_and_correct:
+                        correct_covered += 1
+                else:
+                    low_conf_or_incomplete += 1
+
+                    all_predicted_children_correct = True
+                    any_blocker = False
+                    for status, is_match in field_results:
+                        if status in {"low_conf", "missing_confidence", "null_or_ignored", "missing_pred"}:
+                            any_blocker = True
+                        elif status == "evaluated" and is_match is not True:
+                            all_predicted_children_correct = False
+
+                    if any_blocker and all_predicted_children_correct:
+                        low_conf_but_correct += 1
+
+            rows.append({
+                "folder": folder_name,
+                "group": group,
+                "threshold": threshold,
+                "total": total,
+                "covered": covered,
+                "correct_covered": correct_covered,
+                "coverage": (covered / total) if total else None,
+                "accuracy": (correct_covered / covered) if covered else None,
+                "low_conf_or_incomplete": low_conf_or_incomplete,
+                "low_conf_but_correct": low_conf_but_correct,
+            })
+
+    return pd.DataFrame(rows)
 
 
 # =========================================================
@@ -572,35 +1033,60 @@ def build_all_tables(
 # =========================================================
 
 if __name__ == "__main__":
+    DEFAULT_THRESHOLD = 80
+
+    # 1) child-level file tables
     tables_by_folder = build_all_tables(
         results_root=RESULTS_ROOT,
         gt_root=GROUND_TRUTH_ROOT,
         routes_by_folder=ROUTES_BY_FOLDER,
+        default_threshold=DEFAULT_THRESHOLD,
     )
 
-    summary_df = build_summary_table(
-        tables_by_folder=tables_by_folder,
-        rollup_groups_by_folder=ROLLUP_GROUPS_BY_FOLDER,
-    )
-
-    # save one comparison table per folder
+    # save comparison table per folder
     for folder_name, df in tables_by_folder.items():
         out_csv = f"comparison_{folder_name}.csv"
         df.to_csv(out_csv, index=False)
         print(f"Saved {out_csv}")
 
-        per_field_df = build_per_field_accuracy_table(df)
-        per_field_csv = f"comparison_{folder_name}_child_accuracy.csv"
-        per_field_df.to_csv(per_field_csv, index=False)
-        print(f"Saved {per_field_csv}")
+    # 2) threshold sweep summary
+    threshold_summary_df = build_threshold_sweep_table(
+        results_root=RESULTS_ROOT,
+        gt_root=GROUND_TRUTH_ROOT,
+        routes_by_folder=ROUTES_BY_FOLDER,
+        rollup_groups_by_folder=ROLLUP_GROUPS_BY_FOLDER,
+        thresholds=THRESHOLDS,
+    )
+    threshold_summary_df.to_csv("comparison_threshold_summary.csv", index=False)
+    print("Saved comparison_threshold_summary.csv")
 
-        per_group_df = build_per_group_accuracy_table(
-            df=df,
-            configured_groups=ROLLUP_GROUPS_BY_FOLDER.get(folder_name),
+    # 3) per-folder field + group threshold analyses
+    for folder_name, route in ROUTES_BY_FOLDER.items():
+        result_folder = RESULTS_ROOT / folder_name
+        gt_folder = GROUND_TRUTH_ROOT / folder_name
+
+        if not result_folder.exists() or not gt_folder.exists():
+            continue
+
+        per_field_df = build_per_field_threshold_table(
+            folder_name=folder_name,
+            result_folder=result_folder,
+            gt_folder=gt_folder,
+            route=route,
+            thresholds=THRESHOLDS,
         )
-        per_group_csv = f"comparison_{folder_name}_rollup_accuracy.csv"
-        per_group_df.to_csv(per_group_csv, index=False)
-        print(f"Saved {per_group_csv}")
+        per_field_path = f"comparison_{folder_name}_field_thresholds.csv"
+        per_field_df.to_csv(per_field_path, index=False)
+        print(f"Saved {per_field_path}")
 
-    summary_df.to_csv("comparison_summary.csv", index=False)
-    print("Saved comparison_summary.csv")
+        per_group_df = build_per_group_threshold_table(
+            folder_name=folder_name,
+            result_folder=result_folder,
+            gt_folder=gt_folder,
+            route=route,
+            configured_groups=ROLLUP_GROUPS_BY_FOLDER.get(folder_name),
+            thresholds=THRESHOLDS,
+        )
+        per_group_path = f"comparison_{folder_name}_group_thresholds.csv"
+        per_group_df.to_csv(per_group_path, index=False)
+        print(f"Saved {per_group_path}")
