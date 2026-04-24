@@ -1,0 +1,8 @@
+print(f"\n[{result_name}] [{folder_name}]")
+print("result_folder:", result_folder)
+print("gt_folder:", gt_folder)
+print("result files:", len(result_files))
+print("gt files:", len(gt_files))
+print("common files:", len(common_files))
+print("missing in gt:", len(result_files - gt_files))
+print("missing in prediction:", len(gt_files - result_files))
