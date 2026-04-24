@@ -13,3 +13,6 @@ if pred_subtree is None or gt_subtree is None:
     print("  pred_subtree is None:", pred_subtree is None)
     print("  gt_subtree is None:", gt_subtree is None)
     continue
+
+
+for /r %f in (*_noisy*.json) do call ren "%f" "%%~nxf:_noisy=%%"
