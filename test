@@ -6,3 +6,10 @@ print("gt files:", len(gt_files))
 print("common files:", len(common_files))
 print("missing in gt:", len(result_files - gt_files))
 print("missing in prediction:", len(gt_files - result_files))
+
+if pred_subtree is None or gt_subtree is None:
+    print("Route failed:", result_name, folder_name, rel_path)
+    print("  route:", route)
+    print("  pred_subtree is None:", pred_subtree is None)
+    print("  gt_subtree is None:", gt_subtree is None)
+    continue
