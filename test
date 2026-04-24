@@ -16,3 +16,5 @@ if pred_subtree is None or gt_subtree is None:
 
 
 for /r %f in (*_noisy*.json) do call ren "%f" "%%~nxf:_noisy=%%"
+
+for %f in (*_noisy*.json) do ren "%f" "%f:_noisy=%"
