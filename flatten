@@ -1,0 +1,34 @@
+def flatten_prediction_value_paths(obj: Any, parent_key: str = "") -> Dict[str, Dict[str, Any]]:
+    """
+    Recursively finds every dict with key 'value'.
+    For each value node, finds any key named 'confidence' inside that node.
+    """
+    items = {}
+
+    if isinstance(obj, dict):
+        if "value" in obj:
+            clean_key = parent_key if parent_key else "value"
+            raw_value = obj.get("value")
+
+            confidence = extract_node_confidence(obj)
+
+            items[clean_key] = {
+                "value": normalize_value(raw_value),
+                "confidence": confidence,
+                "has_value": raw_value is not None,
+                "has_confidence": confidence is not None,
+            }
+
+        for k, v in obj.items():
+            if k == "value":
+                continue
+
+            new_key = f"{parent_key}.{k}" if parent_key else k
+            items.update(flatten_prediction_value_paths(v, new_key))
+
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            new_key = f"{parent_key}.{i}" if parent_key else str(i)
+            items.update(flatten_prediction_value_paths(v, new_key))
+
+    return items
