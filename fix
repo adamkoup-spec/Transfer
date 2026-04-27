@@ -1,0 +1,35 @@
+def classify_prediction_status(pred_info: Optional[Dict[str, Any]], threshold: float) -> str:
+    """
+    Returns:
+      - missing_pred
+      - null_no_confidence
+      - null_low_conf
+      - null_high_conf
+      - missing_confidence
+      - low_conf
+      - evaluated
+    """
+    if pred_info is None:
+        return "missing_pred"
+
+    confidence = pred_info.get("confidence")
+    has_confidence = confidence is not None
+
+    has_value = pred_info.get("has_value", False)
+
+    # Null prediction cases
+    if not has_value:
+        if not has_confidence:
+            return "null_no_confidence"
+        if confidence < threshold:
+            return "null_low_conf"
+        return "null_high_conf"
+
+    # Non-null prediction cases
+    if not has_confidence:
+        return "missing_confidence"
+
+    if confidence < threshold:
+        return "low_conf"
+
+    return "evaluated"
