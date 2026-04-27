@@ -1,0 +1,108 @@
+def debug_benchmark_pipeline(
+    model_roots,
+    gt_root,
+    routes_by_folder,
+    threshold=80,
+    max_files=3,
+):
+    for model_name, model_root in model_roots.items():
+        print("\n" + "=" * 100)
+        print(f"MODEL: {model_name}")
+        print(f"MODEL ROOT: {model_root}")
+        print(f"MODEL ROOT EXISTS: {model_root.exists()}")
+
+        if model_root.exists():
+            print("Immediate subfolders:")
+            for p in sorted(model_root.iterdir()):
+                if p.is_dir():
+                    print("  -", repr(p.name))
+
+        for folder_name, route in routes_by_folder.items():
+            print("\n" + "-" * 80)
+            print(f"DOC TYPE: {folder_name}")
+            print(f"ROUTE: {route}")
+
+            result_folder = model_root / folder_name
+            gt_folder = gt_root / folder_name
+
+            result_files = set(list_relative_jsons(result_folder))
+            gt_files = set(list_relative_jsons(gt_folder))
+            common_files = sorted(result_files & gt_files)
+
+            print("result_folder:", result_folder)
+            print("gt_folder    :", gt_folder)
+            print("result_folder exists:", result_folder.exists())
+            print("gt_folder exists    :", gt_folder.exists())
+            print("result json count   :", len(result_files))
+            print("gt json count       :", len(gt_files))
+            print("common json count   :", len(common_files))
+
+            print("\nSample result files:")
+            for p in sorted(result_files)[:5]:
+                print(" ", repr(str(p)))
+
+            print("\nSample GT files:")
+            for p in sorted(gt_files)[:5]:
+                print(" ", repr(str(p)))
+
+            if not common_files:
+                print("\nNO COMMON FILES. Trying basename-only matching...")
+                result_by_name = {p.name: p for p in result_files}
+                gt_by_name = {p.name: p for p in gt_files}
+                common_names = sorted(set(result_by_name) & set(gt_by_name))
+                print("common basenames:", len(common_names))
+                for name in common_names[:5]:
+                    print(" ", repr(name), "=>", result_by_name[name], "|", gt_by_name[name])
+                continue
+
+            for rel_path in common_files[:max_files]:
+                print("\nFile:", rel_path)
+
+                try:
+                    pred_json = load_json(result_folder / rel_path)
+                    gt_json = load_json(gt_folder / rel_path)
+                except Exception as e:
+                    print("  READ ERROR:", e)
+                    continue
+
+                pred_subtree = get_by_route(pred_json, route)
+                gt_subtree = get_by_route(gt_json, route)
+
+                print("  pred route found:", pred_subtree is not None)
+                print("  gt route found  :", gt_subtree is not None)
+
+                if pred_subtree is None:
+                    print("  pred top keys:", list(pred_json.keys())[:20] if isinstance(pred_json, dict) else type(pred_json))
+
+                if gt_subtree is None:
+                    print("  gt top keys:", list(gt_json.keys())[:20] if isinstance(gt_json, dict) else type(gt_json))
+
+                if pred_subtree is None or gt_subtree is None:
+                    continue
+
+                pred_flat = flatten_prediction_value_paths(pred_subtree)
+                gt_flat = flatten_gt_value_paths(gt_subtree)
+
+                print("  pred flattened fields:", len(pred_flat))
+                print("  gt flattened fields  :", len(gt_flat))
+
+                print("  sample pred flat:")
+                for k, v in list(pred_flat.items())[:5]:
+                    print("   ", k, "=>", v)
+
+                print("  sample gt flat:")
+                for k, v in list(gt_flat.items())[:5]:
+                    print("   ", k, "=>", v)
+
+                all_fields = sorted(set(pred_flat.keys()) | set(gt_flat.keys()))
+                valid_gt_fields = [f for f in all_fields if gt_flat.get(f) is not None]
+
+                print("  all fields:", len(all_fields))
+                print("  valid GT fields:", len(valid_gt_fields))
+
+                status_counts = {}
+                for f in valid_gt_fields:
+                    status = classify_prediction_status(pred_flat.get(f), threshold)
+                    status_counts[status] = status_counts.get(status, 0) + 1
+
+                print("  prediction status counts:", status_counts)
