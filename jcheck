@@ -2,6 +2,7 @@ import json
 import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from collections import Counter
 import pandas as pd
 
 
@@ -9,7 +10,14 @@ import pandas as pd
 # CONFIG
 # =========================================================
 
-RESULTS_ROOT = Path(r"C:\path\to\results")
+RUN_ROOTS = [
+    Path(r"C:\path\to\run_1"),
+    Path(r"C:\path\to\run_2"),
+    Path(r"C:\path\to\run_3"),
+    Path(r"C:\path\to\run_4"),
+    Path(r"C:\path\to\run_5"),
+]
+
 GROUND_TRUTH_ROOT = Path(r"C:\path\to\ground_truth")
 
 ROUTES_BY_FOLDER = {
@@ -18,26 +26,14 @@ ROUTES_BY_FOLDER = {
     "C": "data.items",
 }
 
-# Try multiple thresholds
 CONFIDENCE_THRESHOLDS = [0, 50, 60, 70, 80, 90, 95]
 
-# If confidence is 0-1 instead of 0-100, set True
 CONFIDENCE_IS_PROBABILITY = False
 
 STRIP_STRINGS = True
 CASE_INSENSITIVE_STRINGS = False
 
-# Manual corrections to naive exact-match correct count by doc type.
-# Applied at summary level for each threshold.
-MANUAL_CORRECT_OFFSET_BY_FOLDER = {
-    "A": 0,
-    "B": 0,
-    "C": 0,
-    # Example:
-    # "business_address": 5,
-}
-
-OUTPUT_DIR = Path("./performance_metrics_thresholds_output")
+OUTPUT_DIR = Path("./stability_output")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -56,6 +52,17 @@ def normalize_value(x: Any) -> Any:
             x = x.strip()
         if CASE_INSENSITIVE_STRINGS:
             x = x.lower()
+    return x
+
+
+def canonicalize_for_entropy(x: Any) -> Any:
+    """
+    Converts values into hashable / comparable forms.
+    Keeps None as None.
+    Dicts/lists are converted to sorted JSON strings.
+    """
+    if isinstance(x, (dict, list)):
+        return json.dumps(x, sort_keys=True, ensure_ascii=False)
     return x
 
 
@@ -116,7 +123,7 @@ def coerce_confidence(x: Any) -> Optional[float]:
 
 def find_all_confidences(obj: Any) -> List[float]:
     """
-    Recursively find all keys named 'confidence' under a prediction node.
+    Recursively finds all keys named 'confidence' under a node.
     """
     confidences = []
 
@@ -152,11 +159,6 @@ def fbeta_score(
     coverage: Optional[float],
     beta: float = 1.0,
 ) -> Optional[float]:
-    """
-    Harmonic mean of accuracy and coverage.
-    beta=1: balanced.
-    beta=2: coverage-weighted.
-    """
     if accuracy is None or coverage is None:
         return None
 
@@ -197,9 +199,7 @@ def flatten_prediction_value_paths(
         }
     }
 
-    Notes:
-    - value can be None and still counts as a returned prediction.
-    - confidence is only used to exclude explicitly low-confidence predictions.
+    Null is a real prediction value if the prediction node exists.
     """
     items = {}
 
@@ -316,26 +316,83 @@ def is_covered_status(status: str) -> bool:
 
 
 # =========================================================
-# EVALUATE ONE FILE
+# ENTROPY / STABILITY HELPERS
 # =========================================================
 
-def evaluate_one_file(
+def entropy_of_values(values: List[Any]) -> Optional[float]:
+    """
+    Shannon entropy in bits.
+    """
+    if not values:
+        return None
+
+    values = [canonicalize_for_entropy(v) for v in values]
+
+    counts = Counter(values)
+    total = sum(counts.values())
+
+    h = 0.0
+    for c in counts.values():
+        p = c / total
+        h -= p * math.log2(p)
+
+    return h
+
+
+def normalized_entropy(values: List[Any]) -> Optional[float]:
+    """
+    Entropy normalized by log2(n), where n is number of retained runs.
+    0 = perfectly stable.
+    1 = maximally unstable among retained values.
+    """
+    if not values:
+        return None
+
+    if len(values) <= 1:
+        return 0.0
+
+    h = entropy_of_values(values)
+    hmax = math.log2(len(values))
+
+    if h is None or hmax == 0:
+        return None
+
+    return h / hmax
+
+
+def majority_agreement(values: List[Any]) -> Optional[float]:
+    """
+    Most common value count / retained value count.
+    """
+    if not values:
+        return None
+
+    values = [canonicalize_for_entropy(v) for v in values]
+
+    counts = Counter(values)
+    return counts.most_common(1)[0][1] / len(values)
+
+
+def majority_value(values: List[Any]) -> Any:
+    if not values:
+        return None
+
+    canonical_values = [canonicalize_for_entropy(v) for v in values]
+    counts = Counter(canonical_values)
+    return counts.most_common(1)[0][0]
+
+
+# =========================================================
+# PER-RUN METRICS
+# =========================================================
+
+def evaluate_one_run_file(
     gt_flat: Dict[str, Any],
     pred_flat: Dict[str, Dict[str, Any]],
     threshold: float,
 ) -> Dict[str, Any]:
     """
-    Leaf-level only.
-
-    total:
-        all leaf fields appearing in GT or prediction.
-
-    covered:
-        prediction exists and is not explicitly low confidence.
-
-    correct:
-        covered prediction value equals GT value.
-        Null is compared as a real value.
+    Leaf-level file metrics under latest rule.
     """
     all_fields = sorted(set(gt_flat.keys()) | set(pred_flat.keys()))
 
@@ -353,8 +410,6 @@ def evaluate_one_file(
     null_pred_correct = 0
     prediction_only_fields = 0
 
-    per_field = {}
-
     for field in all_fields:
         gt_present = field in gt_flat
         pred_present = field in pred_flat
@@ -362,7 +417,6 @@ def evaluate_one_file(
         gt_val = gt_flat.get(field)
         pred_info = pred_flat.get(field)
         pred_val = pred_info.get("value") if pred_info is not None else None
-        confidence = pred_info.get("confidence") if pred_info is not None else None
 
         if gt_present and gt_val is None:
             null_gt_fields += 1
@@ -371,20 +425,16 @@ def evaluate_one_file(
             prediction_only_fields += 1
 
         status = classify_prediction_status(pred_info, threshold)
-        is_covered = is_covered_status(status)
 
-        match = None
-
-        if is_covered:
+        if is_covered_status(status):
             covered += 1
-            match = pred_val == gt_val
 
-            if match:
+            if pred_val == gt_val:
                 correct += 1
 
             if pred_val is None:
                 null_pred_covered += 1
-                if match:
+                if pred_val == gt_val:
                     null_pred_correct += 1
 
             if status == "covered_with_confidence":
@@ -397,17 +447,6 @@ def evaluate_one_file(
                 missing_pred += 1
             elif status == "explicit_low_conf":
                 explicit_low_conf += 1
-
-        per_field[field] = {
-            "gt_present": gt_present,
-            "pred_present": pred_present,
-            "gt_value": gt_val,
-            "pred_value": pred_val,
-            "confidence": confidence,
-            "status": status,
-            "covered": is_covered,
-            "match": match,
-        }
 
     coverage = covered / total if total else None
     accuracy = correct / covered if covered else None
@@ -430,448 +469,513 @@ def evaluate_one_file(
         "null_pred_covered": null_pred_covered,
         "null_pred_correct": null_pred_correct,
         "prediction_only_fields": prediction_only_fields,
-
-        "per_field": per_field,
     }
 
 
-# =========================================================
-# BUILD PER-FILE TABLE FOR ONE DOC TYPE + THRESHOLD
-# =========================================================
-
-def build_folder_per_file_table(
-    folder_name: str,
-    result_folder: Path,
-    gt_folder: Path,
+def compute_run_metrics_for_doc_type(
+    run_root: Path,
+    gt_root: Path,
+    doc_type: str,
     route: str,
     threshold: float,
-) -> pd.DataFrame:
+) -> Dict[str, Any]:
+    """
+    Computes one row of metrics for one run + one doc type + one threshold.
+    """
+    result_folder = run_root / doc_type
+    gt_folder = gt_root / doc_type
+
     result_files = set(list_relative_jsons(result_folder))
     gt_files = set(list_relative_jsons(gt_folder))
 
-    # Start from result files and evaluate only those with matching GT.
+    # Start from result files, evaluate only those with matching GT.
     common_files = sorted([p for p in result_files if p in gt_files])
 
-    rows = []
+    total = 0
+    covered = 0
+    correct = 0
+
+    missing_pred = 0
+    explicit_low_conf = 0
+    covered_with_confidence = 0
+    covered_without_confidence = 0
+
+    null_gt_fields = 0
+    null_pred_covered = 0
+    null_pred_correct = 0
+    prediction_only_fields = 0
+
+    files_compared = 0
+    route_failures = 0
+    unreadable_files = 0
+    result_file_without_matching_gt_ignored = len(result_files - gt_files)
 
     for rel_path in common_files:
         pred_path = result_folder / rel_path
         gt_path = gt_folder / rel_path
 
-        row = {
-            "doc_type": folder_name,
-            "file": str(rel_path),
-            "threshold": threshold,
-            "status": "OK",
-        }
-
         try:
             pred_json = load_json(pred_path)
             gt_json = load_json(gt_path)
-        except Exception as e:
-            row["status"] = f"read_error: {e}"
-            rows.append(row)
+        except Exception:
+            unreadable_files += 1
             continue
 
         pred_subtree = get_by_route(pred_json, route)
         gt_subtree = get_by_route(gt_json, route)
 
-        if pred_subtree is None:
-            row["status"] = "missing_route_in_prediction"
-            rows.append(row)
-            continue
-
-        if gt_subtree is None:
-            row["status"] = "missing_route_in_gt"
-            rows.append(row)
+        if pred_subtree is None or gt_subtree is None:
+            route_failures += 1
             continue
 
         pred_flat = flatten_prediction_value_paths(pred_subtree)
         gt_flat = flatten_gt_value_paths(gt_subtree)
 
-        eval_result = evaluate_one_file(
+        file_eval = evaluate_one_run_file(
             gt_flat=gt_flat,
             pred_flat=pred_flat,
             threshold=threshold,
         )
 
-        metric_keys = [
-            "total",
-            "covered",
-            "correct",
-            "coverage",
-            "accuracy",
-            "f1_balanced_score",
-            "f2_coverage_weighted_score",
+        files_compared += 1
 
-            "missing_pred",
-            "explicit_low_conf",
-            "covered_with_confidence",
-            "covered_without_confidence",
+        total += file_eval["total"]
+        covered += file_eval["covered"]
+        correct += file_eval["correct"]
 
-            "null_gt_fields",
-            "null_pred_covered",
-            "null_pred_correct",
-            "prediction_only_fields",
-        ]
+        missing_pred += file_eval["missing_pred"]
+        explicit_low_conf += file_eval["explicit_low_conf"]
+        covered_with_confidence += file_eval["covered_with_confidence"]
+        covered_without_confidence += file_eval["covered_without_confidence"]
 
-        for k in metric_keys:
-            row[k] = eval_result[k]
-
-        # Detailed leaf-node columns
-        for field, info in eval_result["per_field"].items():
-            row[f"{field}_gt_present"] = info["gt_present"]
-            row[f"{field}_pred_present"] = info["pred_present"]
-            row[f"{field}_gt"] = info["gt_value"]
-            row[f"{field}_pred"] = info["pred_value"]
-            row[f"{field}_confidence"] = info["confidence"]
-            row[f"{field}_status"] = info["status"]
-            row[f"{field}_covered"] = info["covered"]
-            row[f"{field}_match"] = info["match"]
-
-        rows.append(row)
-
-    # Diagnostic rows only
-    for rel_path in sorted(result_files - gt_files):
-        rows.append({
-            "doc_type": folder_name,
-            "file": str(rel_path),
-            "threshold": threshold,
-            "status": "result_file_without_matching_gt_ignored",
-        })
-
-    df = pd.DataFrame(rows)
-
-    if df.empty:
-        return df
-
-    fixed_first = [
-        "doc_type",
-        "file",
-        "threshold",
-        "status",
-
-        "total",
-        "covered",
-        "correct",
-        "coverage",
-        "accuracy",
-        "f1_balanced_score",
-        "f2_coverage_weighted_score",
-
-        "missing_pred",
-        "explicit_low_conf",
-        "covered_with_confidence",
-        "covered_without_confidence",
-
-        "null_gt_fields",
-        "null_pred_covered",
-        "null_pred_correct",
-        "prediction_only_fields",
-    ]
-
-    fixed_first = [c for c in fixed_first if c in df.columns]
-    remaining = [c for c in df.columns if c not in fixed_first]
-
-    return df[fixed_first + remaining].sort_values(["file"]).reset_index(drop=True)
-
-
-# =========================================================
-# SUMMARY TABLES
-# =========================================================
-
-def build_summary_from_file_table(
-    df: pd.DataFrame,
-    doc_type: str,
-    threshold: float,
-    manual_correct_offset_by_folder: Optional[Dict[str, int]] = None,
-) -> Dict[str, Any]:
-
-    ok_df = df[df["status"] == "OK"].copy() if "status" in df.columns else pd.DataFrame()
-
-    if ok_df.empty:
-        return {
-            "doc_type": doc_type,
-            "threshold": threshold,
-            "files_compared": 0,
-
-            "total": 0,
-            "covered": 0,
-            "correct_raw": 0,
-            "correct_manual_offset": 0,
-            "correct": 0,
-            "coverage": None,
-            "accuracy": None,
-            "f1_balanced_score": None,
-            "f2_coverage_weighted_score": None,
-
-            "missing_pred": 0,
-            "explicit_low_conf": 0,
-            "covered_with_confidence": 0,
-            "covered_without_confidence": 0,
-
-            "null_gt_fields": 0,
-            "null_pred_covered": 0,
-            "null_pred_correct": 0,
-            "prediction_only_fields": 0,
-        }
-
-    total = int(ok_df["total"].sum())
-    covered = int(ok_df["covered"].sum())
-    correct_raw = int(ok_df["correct"].sum())
-
-    manual_offset = 0
-    if manual_correct_offset_by_folder is not None:
-        manual_offset = int(manual_correct_offset_by_folder.get(doc_type, 0))
-
-    correct = min(correct_raw + manual_offset, covered)
+        null_gt_fields += file_eval["null_gt_fields"]
+        null_pred_covered += file_eval["null_pred_covered"]
+        null_pred_correct += file_eval["null_pred_correct"]
+        prediction_only_fields += file_eval["prediction_only_fields"]
 
     coverage = covered / total if total else None
     accuracy = correct / covered if covered else None
 
     return {
+        "run_name": run_root.name,
         "doc_type": doc_type,
         "threshold": threshold,
-        "files_compared": int(len(ok_df)),
+        "files_compared": files_compared,
+        "result_file_without_matching_gt_ignored": result_file_without_matching_gt_ignored,
+        "route_failures": route_failures,
+        "unreadable_files": unreadable_files,
 
         "total": total,
         "covered": covered,
-        "correct_raw": correct_raw,
-        "correct_manual_offset": manual_offset,
         "correct": correct,
         "coverage": coverage,
         "accuracy": accuracy,
         "f1_balanced_score": fbeta_score(accuracy, coverage, beta=1.0),
         "f2_coverage_weighted_score": fbeta_score(accuracy, coverage, beta=2.0),
 
-        "missing_pred": int(ok_df["missing_pred"].sum()),
-        "explicit_low_conf": int(ok_df["explicit_low_conf"].sum()),
-        "covered_with_confidence": int(ok_df["covered_with_confidence"].sum()),
-        "covered_without_confidence": int(ok_df["covered_without_confidence"].sum()),
+        "missing_pred": missing_pred,
+        "explicit_low_conf": explicit_low_conf,
+        "covered_with_confidence": covered_with_confidence,
+        "covered_without_confidence": covered_without_confidence,
 
-        "null_gt_fields": int(ok_df["null_gt_fields"].sum()),
-        "null_pred_covered": int(ok_df["null_pred_covered"].sum()),
-        "null_pred_correct": int(ok_df["null_pred_correct"].sum()),
-        "prediction_only_fields": int(ok_df["prediction_only_fields"].sum()),
+        "null_gt_fields": null_gt_fields,
+        "null_pred_covered": null_pred_covered,
+        "null_pred_correct": null_pred_correct,
+        "prediction_only_fields": prediction_only_fields,
     }
 
 
-def build_per_field_summary(
-    file_df: pd.DataFrame,
+# =========================================================
+# FIELD STABILITY ACROSS RUNS
+# =========================================================
+
+def compute_field_stability_for_doc_type(
+    run_roots: List[Path],
+    gt_root: Path,
     doc_type: str,
+    route: str,
     threshold: float,
 ) -> pd.DataFrame:
-    if file_df.empty or "status" not in file_df.columns:
-        return pd.DataFrame()
+    """
+    One row per doc_type + file + field + threshold.
 
-    ok_df = file_df[file_df["status"] == "OK"].copy()
+    Stability is measured over covered predictions only.
+    Explicit low-confidence and missing predictions are not retained.
+    Null is retained as a value if the prediction node exists and is covered.
+    """
+    gt_folder = gt_root / doc_type
 
-    if ok_df.empty:
-        return pd.DataFrame()
-
-    field_names = sorted({
-        c[:-3] for c in ok_df.columns if c.endswith("_gt")
-    })
+    # Union of GT files and result files across runs
+    file_union = set(list_relative_jsons(gt_folder))
+    for run_root in run_roots:
+        file_union |= set(list_relative_jsons(run_root / doc_type))
 
     rows = []
 
-    for field in field_names:
-        covered_col = f"{field}_covered"
-        match_col = f"{field}_match"
-        status_col = f"{field}_status"
-        conf_col = f"{field}_confidence"
-        gt_present_col = f"{field}_gt_present"
-        pred_present_col = f"{field}_pred_present"
+    run_names = [r.name for r in run_roots]
 
-        if covered_col not in ok_df.columns:
-            continue
+    for rel_path in sorted(file_union):
+        # GT
+        gt_path = gt_folder / rel_path
+        if gt_path.exists():
+            try:
+                gt_json = load_json(gt_path)
+                gt_subtree = get_by_route(gt_json, route)
+                gt_flat = flatten_gt_value_paths(gt_subtree) if gt_subtree is not None else {}
+            except Exception:
+                gt_flat = {}
+        else:
+            gt_flat = {}
 
-        present_mask = pd.Series(False, index=ok_df.index)
+        run_field_maps = []
+        all_fields = set(gt_flat.keys())
 
-        if gt_present_col in ok_df.columns:
-            present_mask = present_mask | ok_df[gt_present_col].fillna(False)
+        for run_root in run_roots:
+            pred_path = run_root / doc_type / rel_path
 
-        if pred_present_col in ok_df.columns:
-            present_mask = present_mask | ok_df[pred_present_col].fillna(False)
+            if pred_path.exists():
+                try:
+                    pred_json = load_json(pred_path)
+                    pred_subtree = get_by_route(pred_json, route)
+                    pred_flat = flatten_prediction_value_paths(pred_subtree) if pred_subtree is not None else {}
+                except Exception:
+                    pred_flat = {}
+            else:
+                pred_flat = {}
 
-        total = int(present_mask.sum())
+            run_field_maps.append((run_root.name, pred_flat))
+            all_fields |= set(pred_flat.keys())
 
-        covered = int(ok_df.loc[present_mask, covered_col].fillna(False).sum())
+        for field in sorted(all_fields):
+            gt_present = field in gt_flat
+            gt_val = gt_flat.get(field)
 
-        correct = 0
-        if match_col in ok_df.columns:
-            covered_mask = present_mask & ok_df[covered_col].fillna(False)
-            correct = int(ok_df.loc[covered_mask, match_col].fillna(False).sum())
+            retained_values = []
+            retained_matches = []
 
-        explicit_low_conf = 0
-        missing_pred = 0
-        covered_with_confidence = 0
-        covered_without_confidence = 0
+            run_statuses = {}
+            run_values = {}
+            run_confidences = {}
+            run_covered = {}
 
-        if status_col in ok_df.columns:
-            statuses = ok_df.loc[present_mask, status_col]
-            explicit_low_conf = int((statuses == "explicit_low_conf").sum())
-            missing_pred = int((statuses == "missing_pred").sum())
-            covered_with_confidence = int((statuses == "covered_with_confidence").sum())
-            covered_without_confidence = int((statuses == "covered_without_confidence").sum())
+            for run_name, pred_flat in run_field_maps:
+                pred_info = pred_flat.get(field)
+                status = classify_prediction_status(pred_info, threshold)
 
-        avg_confidence = None
-        if conf_col in ok_df.columns:
-            avg_confidence = pd.to_numeric(ok_df.loc[present_mask, conf_col], errors="coerce").mean()
+                pred_val = pred_info.get("value") if pred_info is not None else None
+                pred_conf = pred_info.get("confidence") if pred_info is not None else None
+
+                covered = is_covered_status(status)
+
+                run_statuses[run_name] = status
+                run_values[run_name] = pred_val
+                run_confidences[run_name] = pred_conf
+                run_covered[run_name] = covered
+
+                if covered:
+                    retained_values.append(pred_val)
+                    retained_matches.append(pred_val == gt_val)
+
+            n_runs = len(run_roots)
+            n_retained = len(retained_values)
+
+            ent = entropy_of_values(retained_values)
+            nent = normalized_entropy(retained_values)
+            maj_agree = majority_agreement(retained_values)
+            maj_value = majority_value(retained_values)
+
+            majority_correct = None
+            if n_retained > 0:
+                majority_correct = (maj_value == gt_val)
+
+            retained_correct_rate = (
+                sum(retained_matches) / n_retained
+                if n_retained else None
+            )
+
+            row = {
+                "doc_type": doc_type,
+                "file": str(rel_path),
+                "field": field,
+                "threshold": threshold,
+
+                "gt_present": gt_present,
+                "gt_value": gt_val,
+
+                "n_runs": n_runs,
+                "n_retained_runs": n_retained,
+                "retained_coverage": n_retained / n_runs if n_runs else None,
+
+                "majority_value": maj_value,
+                "majority_agreement": maj_agree,
+                "entropy": ent,
+                "normalized_entropy": nent,
+                "fully_stable": (maj_agree == 1.0) if maj_agree is not None else None,
+
+                "majority_correct": majority_correct,
+                "retained_correct_rate": retained_correct_rate,
+            }
+
+            for run_name in run_names:
+                row[f"{run_name}_status"] = run_statuses.get(run_name)
+                row[f"{run_name}_covered"] = run_covered.get(run_name)
+                row[f"{run_name}_value"] = run_values.get(run_name)
+                row[f"{run_name}_confidence"] = run_confidences.get(run_name)
+
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+# =========================================================
+# METRIC STABILITY ACROSS RUNS
+# =========================================================
+
+def compute_metric_stability_across_runs(
+    per_run_metric_df: pd.DataFrame,
+    metric_cols: List[str],
+) -> pd.DataFrame:
+    """
+    Computes run-to-run stability of metrics for each doc type and threshold.
+    """
+    rows = []
+
+    for (doc_type, threshold), grp in per_run_metric_df.groupby(["doc_type", "threshold"], dropna=False):
+        row = {
+            "doc_type": doc_type,
+            "threshold": threshold,
+            "n_runs": len(grp),
+        }
+
+        for metric in metric_cols:
+            vals = pd.to_numeric(grp[metric], errors="coerce").dropna()
+
+            row[f"{metric}_mean"] = vals.mean() if len(vals) else None
+            row[f"{metric}_std"] = vals.std(ddof=0) if len(vals) else None
+            row[f"{metric}_min"] = vals.min() if len(vals) else None
+            row[f"{metric}_max"] = vals.max() if len(vals) else None
+            row[f"{metric}_range"] = (vals.max() - vals.min()) if len(vals) else None
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+# =========================================================
+# OVERALL SUMMARIES
+# =========================================================
+
+def build_overall_metric_per_run(per_run_metric_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Micro-averaged overall metrics by run and threshold across doc types.
+    """
+    rows = []
+
+    for (run_name, threshold), grp in per_run_metric_df.groupby(["run_name", "threshold"], dropna=False):
+        total = int(grp["total"].sum())
+        covered = int(grp["covered"].sum())
+        correct = int(grp["correct"].sum())
 
         coverage = covered / total if total else None
         accuracy = correct / covered if covered else None
 
         rows.append({
-            "doc_type": doc_type,
-            "threshold": threshold,
-            "field": field,
-            "total": total,
-            "covered": covered,
-            "correct": correct,
-            "coverage": coverage,
-            "accuracy": accuracy,
-            "f1_balanced_score": fbeta_score(accuracy, coverage, beta=1.0),
-            "f2_coverage_weighted_score": fbeta_score(accuracy, coverage, beta=2.0),
-
-            "explicit_low_conf": explicit_low_conf,
-            "missing_pred": missing_pred,
-            "covered_with_confidence": covered_with_confidence,
-            "covered_without_confidence": covered_without_confidence,
-            "avg_confidence_when_present": avg_confidence,
-        })
-
-    out = pd.DataFrame(rows)
-
-    if not out.empty:
-        out = out.sort_values(
-            ["threshold", "f1_balanced_score", "coverage", "accuracy"],
-            ascending=[True, True, True, True],
-            na_position="last",
-        ).reset_index(drop=True)
-
-    return out
-
-
-def build_overall_summary(summary_df: pd.DataFrame) -> pd.DataFrame:
-    overall_rows = []
-
-    for threshold, g in summary_df.groupby("threshold", dropna=False):
-        total = int(g["total"].sum())
-        covered = int(g["covered"].sum())
-        correct_raw = int(g["correct_raw"].sum())
-        correct_manual_offset = int(g["correct_manual_offset"].sum())
-        correct = int(g["correct"].sum())
-
-        coverage = covered / total if total else None
-        accuracy = correct / covered if covered else None
-
-        overall_rows.append({
+            "run_name": run_name,
             "doc_type": "OVERALL",
             "threshold": threshold,
-            "files_compared": int(g["files_compared"].sum()),
+            "files_compared": int(grp["files_compared"].sum()),
 
             "total": total,
             "covered": covered,
-            "correct_raw": correct_raw,
-            "correct_manual_offset": correct_manual_offset,
             "correct": correct,
             "coverage": coverage,
             "accuracy": accuracy,
             "f1_balanced_score": fbeta_score(accuracy, coverage, beta=1.0),
             "f2_coverage_weighted_score": fbeta_score(accuracy, coverage, beta=2.0),
 
-            "missing_pred": int(g["missing_pred"].sum()),
-            "explicit_low_conf": int(g["explicit_low_conf"].sum()),
-            "covered_with_confidence": int(g["covered_with_confidence"].sum()),
-            "covered_without_confidence": int(g["covered_without_confidence"].sum()),
+            "missing_pred": int(grp["missing_pred"].sum()),
+            "explicit_low_conf": int(grp["explicit_low_conf"].sum()),
+            "covered_with_confidence": int(grp["covered_with_confidence"].sum()),
+            "covered_without_confidence": int(grp["covered_without_confidence"].sum()),
 
-            "null_gt_fields": int(g["null_gt_fields"].sum()),
-            "null_pred_covered": int(g["null_pred_covered"].sum()),
-            "null_pred_correct": int(g["null_pred_correct"].sum()),
-            "prediction_only_fields": int(g["prediction_only_fields"].sum()),
+            "null_gt_fields": int(grp["null_gt_fields"].sum()),
+            "null_pred_covered": int(grp["null_pred_covered"].sum()),
+            "null_pred_correct": int(grp["null_pred_correct"].sum()),
+            "prediction_only_fields": int(grp["prediction_only_fields"].sum()),
         })
 
-    return pd.DataFrame(overall_rows)
+    return pd.DataFrame(rows)
+
+
+def build_overall_field_stability(field_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Overall field-stability summary across doc types.
+    """
+    rows = []
+
+    for threshold, grp in field_df.groupby("threshold", dropna=False):
+        rows.append({
+            "threshold": threshold,
+            "n_field_file_pairs": len(grp),
+
+            "mean_retained_coverage": pd.to_numeric(grp["retained_coverage"], errors="coerce").mean(),
+            "mean_majority_agreement": pd.to_numeric(grp["majority_agreement"], errors="coerce").mean(),
+            "mean_entropy": pd.to_numeric(grp["entropy"], errors="coerce").mean(),
+            "mean_normalized_entropy": pd.to_numeric(grp["normalized_entropy"], errors="coerce").mean(),
+
+            "fully_stable_rate": grp["fully_stable"].dropna().mean() if "fully_stable" in grp else None,
+            "majority_correct_rate": grp["majority_correct"].dropna().mean() if "majority_correct" in grp else None,
+            "mean_retained_correct_rate": pd.to_numeric(grp["retained_correct_rate"], errors="coerce").mean(),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def build_doc_type_field_stability_summary(field_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Field-stability summary per doc type and threshold.
+    """
+    rows = []
+
+    for (doc_type, threshold), grp in field_df.groupby(["doc_type", "threshold"], dropna=False):
+        rows.append({
+            "doc_type": doc_type,
+            "threshold": threshold,
+            "n_field_file_pairs": len(grp),
+
+            "mean_retained_coverage": pd.to_numeric(grp["retained_coverage"], errors="coerce").mean(),
+            "mean_majority_agreement": pd.to_numeric(grp["majority_agreement"], errors="coerce").mean(),
+            "mean_entropy": pd.to_numeric(grp["entropy"], errors="coerce").mean(),
+            "mean_normalized_entropy": pd.to_numeric(grp["normalized_entropy"], errors="coerce").mean(),
+
+            "fully_stable_rate": grp["fully_stable"].dropna().mean() if "fully_stable" in grp else None,
+            "majority_correct_rate": grp["majority_correct"].dropna().mean() if "majority_correct" in grp else None,
+            "mean_retained_correct_rate": pd.to_numeric(grp["retained_correct_rate"], errors="coerce").mean(),
+        })
+
+    return pd.DataFrame(rows)
 
 
 # =========================================================
-# MAIN PERFORMANCE RUN
+# MAIN
 # =========================================================
 
-def run_performance_evaluation_with_thresholds() -> None:
-    all_summary_rows = []
-    all_field_summaries = []
-    all_file_tables = []
+def run_stability_analysis() -> None:
+    per_run_metric_rows = []
+    field_stability_frames = []
 
     for threshold in CONFIDENCE_THRESHOLDS:
         print(f"\n=== Threshold: {threshold} ===")
 
         for doc_type, route in ROUTES_BY_FOLDER.items():
-            result_folder = RESULTS_ROOT / doc_type
-            gt_folder = GROUND_TRUTH_ROOT / doc_type
+            print(f"Doc type: {doc_type}")
 
-            file_df = build_folder_per_file_table(
-                folder_name=doc_type,
-                result_folder=result_folder,
-                gt_folder=gt_folder,
+            # Per-run metrics
+            for run_root in RUN_ROOTS:
+                row = compute_run_metrics_for_doc_type(
+                    run_root=run_root,
+                    gt_root=GROUND_TRUTH_ROOT,
+                    doc_type=doc_type,
+                    route=route,
+                    threshold=threshold,
+                )
+                per_run_metric_rows.append(row)
+
+            # Field stability across runs
+            field_df = compute_field_stability_for_doc_type(
+                run_roots=RUN_ROOTS,
+                gt_root=GROUND_TRUTH_ROOT,
+                doc_type=doc_type,
                 route=route,
                 threshold=threshold,
             )
+            field_stability_frames.append(field_df)
 
-            all_file_tables.append(file_df)
+    per_run_metric_df = pd.DataFrame(per_run_metric_rows)
+    field_stability_df = (
+        pd.concat(field_stability_frames, ignore_index=True)
+        if field_stability_frames
+        else pd.DataFrame()
+    )
 
-            file_out = OUTPUT_DIR / f"performance_{doc_type}_threshold_{threshold}_per_file.csv"
-            file_df.to_csv(file_out, index=False)
-            print(f"Saved {file_out}")
+    # Overall per-run metrics across doc types
+    overall_per_run_metric_df = build_overall_metric_per_run(per_run_metric_df)
 
-            summary_row = build_summary_from_file_table(
-                df=file_df,
-                doc_type=doc_type,
-                threshold=threshold,
-                manual_correct_offset_by_folder=MANUAL_CORRECT_OFFSET_BY_FOLDER,
-            )
-            all_summary_rows.append(summary_row)
+    per_run_with_overall_df = pd.concat(
+        [per_run_metric_df, overall_per_run_metric_df],
+        ignore_index=True,
+    )
 
-            field_summary = build_per_field_summary(
-                file_df=file_df,
-                doc_type=doc_type,
-                threshold=threshold,
-            )
+    # Metric stability by doc type and threshold
+    metric_cols = [
+        "coverage",
+        "accuracy",
+        "f1_balanced_score",
+        "f2_coverage_weighted_score",
+    ]
 
-            if not field_summary.empty:
-                all_field_summaries.append(field_summary)
+    metric_stability_by_doc_type_df = compute_metric_stability_across_runs(
+        per_run_metric_df=per_run_metric_df,
+        metric_cols=metric_cols,
+    )
 
-                field_out = OUTPUT_DIR / f"performance_{doc_type}_threshold_{threshold}_per_field.csv"
-                field_summary.to_csv(field_out, index=False)
-                print(f"Saved {field_out}")
+    metric_stability_overall_df = compute_metric_stability_across_runs(
+        per_run_metric_df=overall_per_run_metric_df,
+        metric_cols=metric_cols,
+    )
 
-    # Doc-type summary across all thresholds
-    summary_df = pd.DataFrame(all_summary_rows)
+    # Field stability summaries
+    doc_type_field_stability_summary_df = (
+        build_doc_type_field_stability_summary(field_stability_df)
+        if not field_stability_df.empty
+        else pd.DataFrame()
+    )
 
-    # Overall rows per threshold
-    overall_df = build_overall_summary(summary_df)
+    overall_field_stability_summary_df = (
+        build_overall_field_stability(field_stability_df)
+        if not field_stability_df.empty
+        else pd.DataFrame()
+    )
 
-    final_summary_df = pd.concat([summary_df, overall_df], ignore_index=True)
+    # Save outputs
+    per_run_with_overall_df.to_csv(
+        OUTPUT_DIR / "stability_per_run_metrics.csv",
+        index=False,
+    )
 
-    summary_out = OUTPUT_DIR / "performance_summary_all_thresholds.csv"
-    final_summary_df.to_csv(summary_out, index=False)
-    print(f"\nSaved {summary_out}")
+    metric_stability_by_doc_type_df.to_csv(
+        OUTPUT_DIR / "stability_metric_level_by_doc_type.csv",
+        index=False,
+    )
 
-    # Combined field summary
-    if all_field_summaries:
-        all_field_df = pd.concat(all_field_summaries, ignore_index=True)
-        all_field_out = OUTPUT_DIR / "performance_all_fields_all_thresholds.csv"
-        all_field_df.to_csv(all_field_out, index=False)
-        print(f"Saved {all_field_out}")
+    metric_stability_overall_df.to_csv(
+        OUTPUT_DIR / "stability_metric_level_overall.csv",
+        index=False,
+    )
 
-    # Combined per-file table
-    if all_file_tables:
-        all_file_df = pd.concat(all_file_tables, ignore_index=True)
-        all_file_out = OUTPUT_DIR / "performance_all_files_all_thresholds.csv"
-        all_file_df.to_csv(all_file_out, index=False)
-        print(f"Saved {all_file_out}")
+    field_stability_df.to_csv(
+        OUTPUT_DIR / "stability_field_level_detail.csv",
+        index=False,
+    )
+
+    doc_type_field_stability_summary_df.to_csv(
+        OUTPUT_DIR / "stability_field_level_by_doc_type_summary.csv",
+        index=False,
+    )
+
+    overall_field_stability_summary_df.to_csv(
+        OUTPUT_DIR / "stability_field_level_overall_summary.csv",
+        index=False,
+    )
+
+    print("\nSaved:")
+    print(OUTPUT_DIR / "stability_per_run_metrics.csv")
+    print(OUTPUT_DIR / "stability_metric_level_by_doc_type.csv")
+    print(OUTPUT_DIR / "stability_metric_level_overall.csv")
+    print(OUTPUT_DIR / "stability_field_level_detail.csv")
+    print(OUTPUT_DIR / "stability_field_level_by_doc_type_summary.csv")
+    print(OUTPUT_DIR / "stability_field_level_overall_summary.csv")
 
 
 if __name__ == "__main__":
-    run_performance_evaluation_with_thresholds()
+    run_stability_analysis()
