@@ -1,0 +1,1177 @@
+import json
+import math
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from collections import Counter
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+
+RUN_ROOTS = {
+    "Run 1": Path(r"C:\path\to\run_1"),
+    "Run 2": Path(r"C:\path\to\run_2"),
+    "Run 3": Path(r"C:\path\to\run_3"),
+    "Run 4": Path(r"C:\path\to\run_4"),
+    "Run 5": Path(r"C:\path\to\run_5"),
+}
+
+RUN_ORDER = ["Run 1", "Run 2", "Run 3", "Run 4", "Run 5"]
+
+GROUND_TRUTH_ROOT = Path(r"C:\path\to\ground_truth")
+
+ROUTES_BY_FOLDER = {
+    "A": "response.output",
+    "B": "prediction.final",
+    "C": "data.items",
+}
+
+CONFIDENCE_THRESHOLD = 80
+CONFIDENCE_IS_PROBABILITY = False
+
+STRIP_STRINGS = True
+CASE_INSENSITIVE_STRINGS = False
+
+# Manual corrections to naive exact-match correct count.
+# Applied at run + doc_type summary level.
+# Example: if Run 2, folder A has 5 technically correct values missed by exact match,
+# set "Run 2": {"A": 5}
+MANUAL_CORRECT_OFFSET_BY_RUN_AND_FOLDER = {
+    "Run 1": {"A": 0, "B": 0, "C": 0},
+    "Run 2": {"A": 0, "B": 0, "C": 0},
+    "Run 3": {"A": 0, "B": 0, "C": 0},
+    "Run 4": {"A": 0, "B": 0, "C": 0},
+    "Run 5": {"A": 0, "B": 0, "C": 0},
+}
+
+OUTPUT_DIR = Path("./stability_output")
+PLOT_DIR = OUTPUT_DIR / "plots"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+PLOT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# =========================================================
+# BASIC HELPERS
+# =========================================================
+
+def load_json(path: Path) -> Any:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def normalize_value(x: Any) -> Any:
+    if isinstance(x, str):
+        if STRIP_STRINGS:
+            x = x.strip()
+        if CASE_INSENSITIVE_STRINGS:
+            x = x.lower()
+    return x
+
+
+def canonicalize_for_entropy(x: Any) -> Any:
+    if isinstance(x, (dict, list)):
+        return json.dumps(x, sort_keys=True, ensure_ascii=False)
+    return x
+
+
+def get_by_route(obj: Any, route: str) -> Any:
+    cur = obj
+
+    if route is None or route == "":
+        return cur
+
+    for part in route.split("."):
+        if isinstance(cur, dict):
+            if part not in cur:
+                return None
+            cur = cur[part]
+        elif isinstance(cur, list):
+            if not part.isdigit():
+                return None
+            idx = int(part)
+            if idx < 0 or idx >= len(cur):
+                return None
+            cur = cur[idx]
+        else:
+            return None
+
+    return cur
+
+
+def list_relative_jsons(folder: Path) -> List[Path]:
+    if not folder.exists():
+        return []
+    return sorted([p.relative_to(folder) for p in folder.rglob("*.json")])
+
+
+def coerce_confidence(x: Any) -> Optional[float]:
+    if x is None:
+        return None
+
+    try:
+        val = float(x)
+    except Exception:
+        return None
+
+    if math.isnan(val):
+        return None
+
+    if CONFIDENCE_IS_PROBABILITY:
+        val *= 100.0
+
+    return val
+
+
+def find_all_confidences(obj: Any) -> List[float]:
+    confidences = []
+
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == "confidence":
+                c = coerce_confidence(v)
+                if c is not None:
+                    confidences.append(c)
+            else:
+                confidences.extend(find_all_confidences(v))
+
+    elif isinstance(obj, list):
+        for item in obj:
+            confidences.extend(find_all_confidences(item))
+
+    return confidences
+
+
+def extract_node_confidence(obj: Any) -> Optional[float]:
+    confidences = find_all_confidences(obj)
+    if not confidences:
+        return None
+    return max(confidences)
+
+
+def fbeta_score(
+    accuracy: Optional[float],
+    coverage: Optional[float],
+    beta: float = 1.0,
+) -> Optional[float]:
+    if accuracy is None or coverage is None:
+        return None
+
+    if accuracy == 0 and coverage == 0:
+        return 0.0
+
+    beta2 = beta ** 2
+    denom = beta2 * accuracy + coverage
+
+    if denom == 0:
+        return 0.0
+
+    return (1 + beta2) * accuracy * coverage / denom
+
+
+def get_manual_correct_offset(run_name: str, doc_type: str) -> int:
+    return int(
+        MANUAL_CORRECT_OFFSET_BY_RUN_AND_FOLDER
+        .get(run_name, {})
+        .get(doc_type, 0)
+    )
+
+
+# =========================================================
+# FLATTENING
+# =========================================================
+
+def flatten_prediction_value_paths(
+    obj: Any,
+    parent_key: str = "",
+) -> Dict[str, Dict[str, Any]]:
+    items = {}
+
+    if isinstance(obj, dict):
+        if "value" in obj:
+            clean_key = parent_key if parent_key else "value"
+            raw_value = obj.get("value")
+            confidence = extract_node_confidence(obj)
+
+            items[clean_key] = {
+                "value": normalize_value(raw_value),
+                "confidence": confidence,
+                "has_confidence": confidence is not None,
+            }
+
+        for k, v in obj.items():
+            if k == "value":
+                continue
+
+            new_key = f"{parent_key}.{k}" if parent_key else k
+            items.update(flatten_prediction_value_paths(v, new_key))
+
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            new_key = f"{parent_key}.{i}" if parent_key else str(i)
+            items.update(flatten_prediction_value_paths(v, new_key))
+
+    return items
+
+
+def flatten_gt_value_paths(
+    obj: Any,
+    parent_key: str = "",
+) -> Dict[str, Any]:
+    items = {}
+
+    if isinstance(obj, dict):
+        if "value" in obj:
+            clean_key = parent_key if parent_key else "value"
+            items[clean_key] = normalize_value(obj.get("value"))
+
+        for k, v in obj.items():
+            if k == "value":
+                continue
+
+            new_key = f"{parent_key}.{k}" if parent_key else k
+            items.update(flatten_gt_value_paths(v, new_key))
+
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            new_key = f"{parent_key}.{i}" if parent_key else str(i)
+            items.update(flatten_gt_value_paths(v, new_key))
+
+    return items
+
+
+# =========================================================
+# STATUS / COVERAGE LOGIC
+# =========================================================
+
+def classify_prediction_status(
+    pred_info: Optional[Dict[str, Any]],
+    threshold: float = CONFIDENCE_THRESHOLD,
+) -> str:
+    """
+    Latest rule:
+
+    missing_pred:
+        prediction key/node does not exist
+        => not covered
+
+    explicit_low_conf:
+        prediction exists, confidence exists, confidence < threshold
+        => not covered
+
+    covered_with_confidence:
+        prediction exists, confidence exists, confidence >= threshold
+        => covered
+
+    covered_without_confidence:
+        prediction exists, confidence missing/null
+        => covered
+
+    This applies whether prediction value is null or non-null.
+    """
+    if pred_info is None:
+        return "missing_pred"
+
+    confidence = pred_info.get("confidence")
+
+    if confidence is not None and confidence < threshold:
+        return "explicit_low_conf"
+
+    if confidence is not None and confidence >= threshold:
+        return "covered_with_confidence"
+
+    return "covered_without_confidence"
+
+
+def is_covered_status(status: str) -> bool:
+    return status in {
+        "covered_with_confidence",
+        "covered_without_confidence",
+    }
+
+
+# =========================================================
+# ENTROPY / STABILITY HELPERS
+# =========================================================
+
+def entropy_of_values(values: List[Any]) -> Optional[float]:
+    if not values:
+        return None
+
+    values = [canonicalize_for_entropy(v) for v in values]
+    counts = Counter(values)
+    total = sum(counts.values())
+
+    h = 0.0
+    for c in counts.values():
+        p = c / total
+        h -= p * math.log2(p)
+
+    return h
+
+
+def normalized_entropy(values: List[Any]) -> Optional[float]:
+    if not values:
+        return None
+    if len(values) <= 1:
+        return 0.0
+
+    h = entropy_of_values(values)
+    hmax = math.log2(len(values))
+
+    if h is None or hmax == 0:
+        return None
+
+    return h / hmax
+
+
+def majority_agreement(values: List[Any]) -> Optional[float]:
+    if not values:
+        return None
+
+    values = [canonicalize_for_entropy(v) for v in values]
+    counts = Counter(values)
+
+    return counts.most_common(1)[0][1] / len(values)
+
+
+def majority_value(values: List[Any]) -> Any:
+    if not values:
+        return None
+
+    canonical_values = [canonicalize_for_entropy(v) for v in values]
+    counts = Counter(canonical_values)
+
+    return counts.most_common(1)[0][0]
+
+
+# =========================================================
+# PER-RUN METRICS
+# =========================================================
+
+def evaluate_one_run_file(
+    gt_flat: Dict[str, Any],
+    pred_flat: Dict[str, Dict[str, Any]],
+    threshold: float = CONFIDENCE_THRESHOLD,
+) -> Dict[str, Any]:
+    all_fields = sorted(set(gt_flat.keys()) | set(pred_flat.keys()))
+
+    total = len(all_fields)
+    covered = 0
+    correct = 0
+
+    missing_pred = 0
+    explicit_low_conf = 0
+    covered_with_confidence = 0
+    covered_without_confidence = 0
+
+    null_gt_fields = 0
+    null_pred_covered = 0
+    null_pred_correct = 0
+    prediction_only_fields = 0
+
+    for field in all_fields:
+        gt_present = field in gt_flat
+        pred_present = field in pred_flat
+
+        gt_val = gt_flat.get(field)
+        pred_info = pred_flat.get(field)
+        pred_val = pred_info.get("value") if pred_info is not None else None
+
+        if gt_present and gt_val is None:
+            null_gt_fields += 1
+
+        if pred_present and not gt_present:
+            prediction_only_fields += 1
+
+        status = classify_prediction_status(pred_info, threshold)
+
+        if is_covered_status(status):
+            covered += 1
+
+            if pred_val == gt_val:
+                correct += 1
+
+            if pred_val is None:
+                null_pred_covered += 1
+                if pred_val == gt_val:
+                    null_pred_correct += 1
+
+            if status == "covered_with_confidence":
+                covered_with_confidence += 1
+            elif status == "covered_without_confidence":
+                covered_without_confidence += 1
+
+        else:
+            if status == "missing_pred":
+                missing_pred += 1
+            elif status == "explicit_low_conf":
+                explicit_low_conf += 1
+
+    coverage = covered / total if total else None
+    accuracy = correct / covered if covered else None
+
+    return {
+        "total": total,
+        "covered": covered,
+        "correct": correct,
+        "coverage": coverage,
+        "accuracy": accuracy,
+        "f1_balanced_score": fbeta_score(accuracy, coverage, beta=1.0),
+        "f2_coverage_weighted_score": fbeta_score(accuracy, coverage, beta=2.0),
+
+        "missing_pred": missing_pred,
+        "explicit_low_conf": explicit_low_conf,
+        "covered_with_confidence": covered_with_confidence,
+        "covered_without_confidence": covered_without_confidence,
+
+        "null_gt_fields": null_gt_fields,
+        "null_pred_covered": null_pred_covered,
+        "null_pred_correct": null_pred_correct,
+        "prediction_only_fields": prediction_only_fields,
+    }
+
+
+def compute_run_metrics_for_doc_type(
+    run_name: str,
+    run_root: Path,
+    gt_root: Path,
+    doc_type: str,
+    route: str,
+    threshold: float = CONFIDENCE_THRESHOLD,
+) -> Dict[str, Any]:
+    result_folder = run_root / doc_type
+    gt_folder = gt_root / doc_type
+
+    result_files = set(list_relative_jsons(result_folder))
+    gt_files = set(list_relative_jsons(gt_folder))
+
+    common_files = sorted([p for p in result_files if p in gt_files])
+
+    total = 0
+    covered = 0
+    correct_raw = 0
+
+    missing_pred = 0
+    explicit_low_conf = 0
+    covered_with_confidence = 0
+    covered_without_confidence = 0
+
+    null_gt_fields = 0
+    null_pred_covered = 0
+    null_pred_correct = 0
+    prediction_only_fields = 0
+
+    files_compared = 0
+    route_failures = 0
+    unreadable_files = 0
+    result_file_without_matching_gt_ignored = len(result_files - gt_files)
+    gt_file_without_matching_result_ignored = len(gt_files - result_files)
+
+    for rel_path in common_files:
+        pred_path = result_folder / rel_path
+        gt_path = gt_folder / rel_path
+
+        try:
+            pred_json = load_json(pred_path)
+            gt_json = load_json(gt_path)
+        except Exception:
+            unreadable_files += 1
+            continue
+
+        pred_subtree = get_by_route(pred_json, route)
+        gt_subtree = get_by_route(gt_json, route)
+
+        if pred_subtree is None or gt_subtree is None:
+            route_failures += 1
+            continue
+
+        pred_flat = flatten_prediction_value_paths(pred_subtree)
+        gt_flat = flatten_gt_value_paths(gt_subtree)
+
+        file_eval = evaluate_one_run_file(
+            gt_flat=gt_flat,
+            pred_flat=pred_flat,
+            threshold=threshold,
+        )
+
+        files_compared += 1
+
+        total += file_eval["total"]
+        covered += file_eval["covered"]
+        correct_raw += file_eval["correct"]
+
+        missing_pred += file_eval["missing_pred"]
+        explicit_low_conf += file_eval["explicit_low_conf"]
+        covered_with_confidence += file_eval["covered_with_confidence"]
+        covered_without_confidence += file_eval["covered_without_confidence"]
+
+        null_gt_fields += file_eval["null_gt_fields"]
+        null_pred_covered += file_eval["null_pred_covered"]
+        null_pred_correct += file_eval["null_pred_correct"]
+        prediction_only_fields += file_eval["prediction_only_fields"]
+
+    manual_offset = get_manual_correct_offset(run_name, doc_type)
+    correct = min(correct_raw + manual_offset, covered)
+
+    coverage = covered / total if total else None
+    accuracy = correct / covered if covered else None
+
+    return {
+        "run_name": run_name,
+        "doc_type": doc_type,
+        "threshold": threshold,
+        "files_compared": files_compared,
+
+        "result_file_without_matching_gt_ignored": result_file_without_matching_gt_ignored,
+        "gt_file_without_matching_result_ignored": gt_file_without_matching_result_ignored,
+        "route_failures": route_failures,
+        "unreadable_files": unreadable_files,
+
+        "total": total,
+        "covered": covered,
+        "correct_raw": correct_raw,
+        "correct_manual_offset": manual_offset,
+        "correct": correct,
+        "coverage": coverage,
+        "accuracy": accuracy,
+        "f1_balanced_score": fbeta_score(accuracy, coverage, beta=1.0),
+        "f2_coverage_weighted_score": fbeta_score(accuracy, coverage, beta=2.0),
+
+        "missing_pred": missing_pred,
+        "explicit_low_conf": explicit_low_conf,
+        "covered_with_confidence": covered_with_confidence,
+        "covered_without_confidence": covered_without_confidence,
+
+        "null_gt_fields": null_gt_fields,
+        "null_pred_covered": null_pred_covered,
+        "null_pred_correct": null_pred_correct,
+        "prediction_only_fields": prediction_only_fields,
+    }
+
+
+# =========================================================
+# FIELD STABILITY ACROSS RUNS
+# =========================================================
+
+def compute_field_stability_for_doc_type(
+    run_roots: Dict[str, Path],
+    gt_root: Path,
+    doc_type: str,
+    route: str,
+    threshold: float = CONFIDENCE_THRESHOLD,
+) -> pd.DataFrame:
+    gt_folder = gt_root / doc_type
+
+    file_union = set(list_relative_jsons(gt_folder))
+    for _, run_root in run_roots.items():
+        file_union |= set(list_relative_jsons(run_root / doc_type))
+
+    rows = []
+
+    for rel_path in sorted(file_union):
+        gt_path = gt_folder / rel_path
+
+        if gt_path.exists():
+            try:
+                gt_json = load_json(gt_path)
+                gt_subtree = get_by_route(gt_json, route)
+                gt_flat = flatten_gt_value_paths(gt_subtree) if gt_subtree is not None else {}
+            except Exception:
+                gt_flat = {}
+        else:
+            gt_flat = {}
+
+        run_field_maps = []
+        all_fields = set(gt_flat.keys())
+
+        for run_name, run_root in run_roots.items():
+            pred_path = run_root / doc_type / rel_path
+
+            if pred_path.exists():
+                try:
+                    pred_json = load_json(pred_path)
+                    pred_subtree = get_by_route(pred_json, route)
+                    pred_flat = flatten_prediction_value_paths(pred_subtree) if pred_subtree is not None else {}
+                except Exception:
+                    pred_flat = {}
+            else:
+                pred_flat = {}
+
+            run_field_maps.append((run_name, pred_flat))
+            all_fields |= set(pred_flat.keys())
+
+        for field in sorted(all_fields):
+            gt_present = field in gt_flat
+            gt_val = gt_flat.get(field)
+
+            retained_values = []
+            retained_matches = []
+
+            run_statuses = {}
+            run_values = {}
+            run_confidences = {}
+            run_covered = {}
+
+            for run_name, pred_flat in run_field_maps:
+                pred_info = pred_flat.get(field)
+                status = classify_prediction_status(pred_info, threshold)
+
+                pred_val = pred_info.get("value") if pred_info is not None else None
+                pred_conf = pred_info.get("confidence") if pred_info is not None else None
+
+                covered = is_covered_status(status)
+
+                run_statuses[run_name] = status
+                run_values[run_name] = pred_val
+                run_confidences[run_name] = pred_conf
+                run_covered[run_name] = covered
+
+                if covered:
+                    retained_values.append(pred_val)
+                    retained_matches.append(pred_val == gt_val)
+
+            n_runs = len(run_roots)
+            n_retained = len(retained_values)
+
+            ent = entropy_of_values(retained_values)
+            nent = normalized_entropy(retained_values)
+            maj_agree = majority_agreement(retained_values)
+            maj_value = majority_value(retained_values)
+
+            majority_correct = None
+            if n_retained > 0:
+                majority_correct = (maj_value == gt_val)
+
+            retained_correct_rate = (
+                sum(retained_matches) / n_retained
+                if n_retained else None
+            )
+
+            row = {
+                "doc_type": doc_type,
+                "file": str(rel_path),
+                "field": field,
+                "threshold": threshold,
+
+                "gt_present": gt_present,
+                "gt_value": gt_val,
+
+                "n_runs": n_runs,
+                "n_retained_runs": n_retained,
+                "retained_coverage": n_retained / n_runs if n_runs else None,
+
+                "majority_value": maj_value,
+                "majority_agreement": maj_agree,
+                "entropy": ent,
+                "normalized_entropy": nent,
+                "fully_stable": (maj_agree == 1.0) if maj_agree is not None else None,
+
+                "majority_correct": majority_correct,
+                "retained_correct_rate": retained_correct_rate,
+            }
+
+            for run_name in RUN_ORDER:
+                if run_name not in run_roots:
+                    continue
+                row[f"{run_name}_status"] = run_statuses.get(run_name)
+                row[f"{run_name}_covered"] = run_covered.get(run_name)
+                row[f"{run_name}_value"] = run_values.get(run_name)
+                row[f"{run_name}_confidence"] = run_confidences.get(run_name)
+
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+# =========================================================
+# SUMMARY TABLES
+# =========================================================
+
+def build_overall_metric_per_run(per_run_metric_df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+
+    for run_name, grp in per_run_metric_df.groupby("run_name", dropna=False):
+        total = int(grp["total"].sum())
+        covered = int(grp["covered"].sum())
+        correct_raw = int(grp["correct_raw"].sum())
+        correct_manual_offset = int(grp["correct_manual_offset"].sum())
+        correct = int(grp["correct"].sum())
+
+        coverage = covered / total if total else None
+        accuracy = correct / covered if covered else None
+
+        rows.append({
+            "run_name": run_name,
+            "doc_type": "OVERALL",
+            "threshold": CONFIDENCE_THRESHOLD,
+            "files_compared": int(grp["files_compared"].sum()),
+
+            "total": total,
+            "covered": covered,
+            "correct_raw": correct_raw,
+            "correct_manual_offset": correct_manual_offset,
+            "correct": correct,
+            "coverage": coverage,
+            "accuracy": accuracy,
+            "f1_balanced_score": fbeta_score(accuracy, coverage, beta=1.0),
+            "f2_coverage_weighted_score": fbeta_score(accuracy, coverage, beta=2.0),
+
+            "missing_pred": int(grp["missing_pred"].sum()),
+            "explicit_low_conf": int(grp["explicit_low_conf"].sum()),
+            "covered_with_confidence": int(grp["covered_with_confidence"].sum()),
+            "covered_without_confidence": int(grp["covered_without_confidence"].sum()),
+
+            "null_gt_fields": int(grp["null_gt_fields"].sum()),
+            "null_pred_covered": int(grp["null_pred_covered"].sum()),
+            "null_pred_correct": int(grp["null_pred_correct"].sum()),
+            "prediction_only_fields": int(grp["prediction_only_fields"].sum()),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def compute_metric_stability_across_runs(
+    per_run_metric_df: pd.DataFrame,
+    metric_cols: List[str],
+) -> pd.DataFrame:
+    rows = []
+
+    for doc_type, grp in per_run_metric_df.groupby("doc_type", dropna=False):
+        row = {
+            "doc_type": doc_type,
+            "n_runs": len(grp),
+        }
+
+        for metric in metric_cols:
+            vals = pd.to_numeric(grp[metric], errors="coerce").dropna()
+
+            row[f"{metric}_mean"] = vals.mean() if len(vals) else None
+            row[f"{metric}_std"] = vals.std(ddof=0) if len(vals) else None
+            row[f"{metric}_min"] = vals.min() if len(vals) else None
+            row[f"{metric}_max"] = vals.max() if len(vals) else None
+            row[f"{metric}_range"] = (vals.max() - vals.min()) if len(vals) else None
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def build_doc_type_field_stability_summary(field_df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+
+    for doc_type, grp in field_df.groupby("doc_type", dropna=False):
+        rows.append({
+            "doc_type": doc_type,
+            "n_field_file_pairs": len(grp),
+
+            "mean_retained_coverage": pd.to_numeric(grp["retained_coverage"], errors="coerce").mean(),
+            "mean_majority_agreement": pd.to_numeric(grp["majority_agreement"], errors="coerce").mean(),
+            "mean_entropy": pd.to_numeric(grp["entropy"], errors="coerce").mean(),
+            "mean_normalized_entropy": pd.to_numeric(grp["normalized_entropy"], errors="coerce").mean(),
+
+            "fully_stable_rate": grp["fully_stable"].dropna().mean() if "fully_stable" in grp else None,
+            "majority_correct_rate": grp["majority_correct"].dropna().mean() if "majority_correct" in grp else None,
+            "mean_retained_correct_rate": pd.to_numeric(grp["retained_correct_rate"], errors="coerce").mean(),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def build_overall_field_stability(field_df: pd.DataFrame) -> pd.DataFrame:
+    if field_df.empty:
+        return pd.DataFrame()
+
+    return pd.DataFrame([{
+        "doc_type": "OVERALL",
+        "n_field_file_pairs": len(field_df),
+
+        "mean_retained_coverage": pd.to_numeric(field_df["retained_coverage"], errors="coerce").mean(),
+        "mean_majority_agreement": pd.to_numeric(field_df["majority_agreement"], errors="coerce").mean(),
+        "mean_entropy": pd.to_numeric(field_df["entropy"], errors="coerce").mean(),
+        "mean_normalized_entropy": pd.to_numeric(field_df["normalized_entropy"], errors="coerce").mean(),
+
+        "fully_stable_rate": field_df["fully_stable"].dropna().mean() if "fully_stable" in field_df else None,
+        "majority_correct_rate": field_df["majority_correct"].dropna().mean() if "majority_correct" in field_df else None,
+        "mean_retained_correct_rate": pd.to_numeric(field_df["retained_correct_rate"], errors="coerce").mean(),
+    }])
+
+
+# =========================================================
+# PLOTS
+# =========================================================
+
+def ordered_run_names(df: pd.DataFrame) -> List[str]:
+    present = set(df["run_name"])
+    return [r for r in RUN_ORDER if r in present]
+
+
+def save_bar_metric_by_run(per_run_df: pd.DataFrame, metric: str, output_path: Path) -> None:
+    plot_df = per_run_df.copy()
+    plot_df[metric] = pd.to_numeric(plot_df[metric], errors="coerce")
+
+    pivot = plot_df.pivot(index="doc_type", columns="run_name", values=metric)
+    cols = [r for r in RUN_ORDER if r in pivot.columns]
+    pivot = pivot[cols]
+
+    if pivot.dropna(how="all").empty:
+        print(f"Skipping {metric} plot: no numeric data.")
+        return
+
+    ax = pivot.plot(kind="bar", figsize=(12, 6))
+    ax.set_title(f"{metric.replace('_', ' ').title()} by Doc Type and Run")
+    ax.set_xlabel("Doc Type")
+    ax.set_ylabel(metric.replace("_", " ").title())
+    ax.set_ylim(0, 1)
+    ax.legend(title="Run", bbox_to_anchor=(1.02, 1), loc="upper left")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+
+
+def save_metric_range_plot(metric_stability_df: pd.DataFrame, metric: str, output_path: Path) -> None:
+    df = metric_stability_df.copy()
+    col = f"{metric}_range"
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if df[col].dropna().empty:
+        print(f"Skipping {metric} range plot: no numeric data.")
+        return
+
+    df = df.sort_values(col, ascending=False)
+
+    ax = df.plot(x="doc_type", y=col, kind="bar", figsize=(10, 5), legend=False)
+    ax.set_title(f"Run-to-Run Fluctuation: {metric.replace('_', ' ').title()} Range")
+    ax.set_xlabel("Doc Type")
+    ax.set_ylabel("Max - Min Across Runs")
+    ax.set_ylim(0, max(0.05, df[col].max() * 1.15))
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+
+
+def save_field_stability_summary_plot(field_summary_df: pd.DataFrame, output_path: Path) -> None:
+    if field_summary_df.empty:
+        return
+
+    metrics = [
+        "mean_retained_coverage",
+        "mean_majority_agreement",
+        "mean_normalized_entropy",
+        "fully_stable_rate",
+        "majority_correct_rate",
+    ]
+
+    plot_df = field_summary_df.set_index("doc_type")[metrics].copy()
+    plot_df = plot_df.apply(pd.to_numeric, errors="coerce")
+
+    if plot_df.dropna(how="all").empty:
+        print("Skipping field stability summary plot: no numeric data.")
+        return
+
+    ax = plot_df.plot(kind="bar", figsize=(13, 6))
+    ax.set_title("Field-Level Stability Summary by Doc Type")
+    ax.set_xlabel("Doc Type")
+    ax.set_ylabel("Metric Value")
+    ax.set_ylim(0, 1)
+    ax.legend(title="Metric", bbox_to_anchor=(1.02, 1), loc="upper left")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+
+
+def save_top_unstable_fields_plot(field_df: pd.DataFrame, output_path: Path, top_n: int = 25) -> None:
+    if field_df.empty:
+        return
+
+    df = field_df.copy()
+    df["normalized_entropy"] = pd.to_numeric(df["normalized_entropy"], errors="coerce")
+    df["retained_coverage"] = pd.to_numeric(df["retained_coverage"], errors="coerce")
+
+    # Focus on fields that were retained in at least 2 runs;
+    # otherwise entropy is not informative.
+    df = df[df["n_retained_runs"] >= 2].copy()
+    df = df.dropna(subset=["normalized_entropy"])
+
+    if df.empty:
+        print("Skipping top unstable fields plot: no eligible fields.")
+        return
+
+    df["display"] = df["doc_type"] + " | " + df["field"].astype(str)
+    top = df.sort_values(["normalized_entropy", "retained_coverage"], ascending=[False, False]).head(top_n)
+
+    ax = top.sort_values("normalized_entropy").plot(
+        x="display",
+        y="normalized_entropy",
+        kind="barh",
+        figsize=(12, max(6, top_n * 0.28)),
+        legend=False,
+    )
+    ax.set_title(f"Top {top_n} Most Unstable Fields")
+    ax.set_xlabel("Normalized Entropy")
+    ax.set_ylabel("Doc Type | Field")
+    ax.set_xlim(0, 1)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+
+
+def save_coverage_accuracy_scatter(per_run_with_overall_df: pd.DataFrame, output_path: Path) -> None:
+    df = per_run_with_overall_df.copy()
+    df["coverage"] = pd.to_numeric(df["coverage"], errors="coerce")
+    df["accuracy"] = pd.to_numeric(df["accuracy"], errors="coerce")
+
+    df = df.dropna(subset=["coverage", "accuracy"])
+
+    if df.empty:
+        print("Skipping coverage-accuracy scatter: no numeric data.")
+        return
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+
+    for _, row in df.iterrows():
+        label = f"{row['run_name']} - {row['doc_type']}"
+        ax.scatter(row["coverage"], row["accuracy"])
+        ax.annotate(label, (row["coverage"], row["accuracy"]), xytext=(5, 5), textcoords="offset points", fontsize=8)
+
+    ax.set_title("Coverage vs Accuracy Across Runs and Doc Types")
+    ax.set_xlabel("Coverage")
+    ax.set_ylabel("Accuracy")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+
+
+def save_stability_heatmap(field_summary_df: pd.DataFrame, output_path: Path) -> None:
+    if field_summary_df.empty:
+        return
+
+    metric_cols = [
+        "mean_retained_coverage",
+        "mean_majority_agreement",
+        "mean_normalized_entropy",
+        "fully_stable_rate",
+        "majority_correct_rate",
+    ]
+
+    df = field_summary_df.set_index("doc_type")[metric_cols].apply(pd.to_numeric, errors="coerce")
+
+    if df.dropna(how="all").empty:
+        print("Skipping heatmap: no numeric data.")
+        return
+
+    fig, ax = plt.subplots(figsize=(10, max(4, len(df) * 0.6)))
+
+    im = ax.imshow(df.values, aspect="auto")
+
+    ax.set_xticks(range(len(df.columns)))
+    ax.set_xticklabels([c.replace("_", "\n") for c in df.columns], rotation=0, fontsize=8)
+    ax.set_yticks(range(len(df.index)))
+    ax.set_yticklabels(df.index)
+
+    for i in range(df.shape[0]):
+        for j in range(df.shape[1]):
+            val = df.iloc[i, j]
+            if pd.notna(val):
+                ax.text(j, i, f"{val:.2f}", ha="center", va="center", fontsize=8)
+
+    ax.set_title("Field Stability Heatmap by Doc Type")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+
+
+def generate_plots(
+    per_run_metric_df: pd.DataFrame,
+    per_run_with_overall_df: pd.DataFrame,
+    metric_stability_df: pd.DataFrame,
+    field_df: pd.DataFrame,
+    field_summary_df: pd.DataFrame,
+) -> None:
+    save_bar_metric_by_run(
+        per_run_metric_df,
+        metric="coverage",
+        output_path=PLOT_DIR / "coverage_by_doc_type_and_run.png",
+    )
+
+    save_bar_metric_by_run(
+        per_run_metric_df,
+        metric="accuracy",
+        output_path=PLOT_DIR / "accuracy_by_doc_type_and_run.png",
+    )
+
+    save_bar_metric_by_run(
+        per_run_metric_df,
+        metric="f1_balanced_score",
+        output_path=PLOT_DIR / "balanced_score_by_doc_type_and_run.png",
+    )
+
+    save_metric_range_plot(
+        metric_stability_df,
+        metric="coverage",
+        output_path=PLOT_DIR / "coverage_range_across_runs.png",
+    )
+
+    save_metric_range_plot(
+        metric_stability_df,
+        metric="accuracy",
+        output_path=PLOT_DIR / "accuracy_range_across_runs.png",
+    )
+
+    save_metric_range_plot(
+        metric_stability_df,
+        metric="f1_balanced_score",
+        output_path=PLOT_DIR / "balanced_score_range_across_runs.png",
+    )
+
+    save_field_stability_summary_plot(
+        field_summary_df,
+        output_path=PLOT_DIR / "field_stability_summary_by_doc_type.png",
+    )
+
+    save_top_unstable_fields_plot(
+        field_df,
+        output_path=PLOT_DIR / "top_unstable_fields.png",
+        top_n=25,
+    )
+
+    save_coverage_accuracy_scatter(
+        per_run_with_overall_df,
+        output_path=PLOT_DIR / "coverage_vs_accuracy_scatter.png",
+    )
+
+    save_stability_heatmap(
+        field_summary_df,
+        output_path=PLOT_DIR / "field_stability_heatmap.png",
+    )
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+def run_stability_analysis() -> None:
+    per_run_metric_rows = []
+    field_stability_frames = []
+
+    for doc_type, route in ROUTES_BY_FOLDER.items():
+        print(f"\nDoc type: {doc_type}")
+
+        for run_name, run_root in RUN_ROOTS.items():
+            row = compute_run_metrics_for_doc_type(
+                run_name=run_name,
+                run_root=run_root,
+                gt_root=GROUND_TRUTH_ROOT,
+                doc_type=doc_type,
+                route=route,
+                threshold=CONFIDENCE_THRESHOLD,
+            )
+            per_run_metric_rows.append(row)
+
+        field_df = compute_field_stability_for_doc_type(
+            run_roots=RUN_ROOTS,
+            gt_root=GROUND_TRUTH_ROOT,
+            doc_type=doc_type,
+            route=route,
+            threshold=CONFIDENCE_THRESHOLD,
+        )
+        field_stability_frames.append(field_df)
+
+    per_run_metric_df = pd.DataFrame(per_run_metric_rows)
+
+    field_stability_df = (
+        pd.concat(field_stability_frames, ignore_index=True)
+        if field_stability_frames
+        else pd.DataFrame()
+    )
+
+    overall_per_run_metric_df = build_overall_metric_per_run(per_run_metric_df)
+
+    per_run_with_overall_df = pd.concat(
+        [per_run_metric_df, overall_per_run_metric_df],
+        ignore_index=True,
+    )
+
+    metric_cols = [
+        "coverage",
+        "accuracy",
+        "f1_balanced_score",
+        "f2_coverage_weighted_score",
+    ]
+
+    metric_stability_by_doc_type_df = compute_metric_stability_across_runs(
+        per_run_metric_df=per_run_metric_df,
+        metric_cols=metric_cols,
+    )
+
+    metric_stability_overall_df = compute_metric_stability_across_runs(
+        per_run_metric_df=overall_per_run_metric_df,
+        metric_cols=metric_cols,
+    )
+
+    field_summary_by_doc_type_df = (
+        build_doc_type_field_stability_summary(field_stability_df)
+        if not field_stability_df.empty
+        else pd.DataFrame()
+    )
+
+    field_summary_overall_df = (
+        build_overall_field_stability(field_stability_df)
+        if not field_stability_df.empty
+        else pd.DataFrame()
+    )
+
+    # Save CSVs
+    per_run_with_overall_df.to_csv(
+        OUTPUT_DIR / "stability_per_run_metrics.csv",
+        index=False,
+    )
+
+    metric_stability_by_doc_type_df.to_csv(
+        OUTPUT_DIR / "stability_metric_level_by_doc_type.csv",
+        index=False,
+    )
+
+    metric_stability_overall_df.to_csv(
+        OUTPUT_DIR / "stability_metric_level_overall.csv",
+        index=False,
+    )
+
+    field_stability_df.to_csv(
+        OUTPUT_DIR / "stability_field_level_detail.csv",
+        index=False,
+    )
+
+    field_summary_by_doc_type_df.to_csv(
+        OUTPUT_DIR / "stability_field_level_by_doc_type_summary.csv",
+        index=False,
+    )
+
+    field_summary_overall_df.to_csv(
+        OUTPUT_DIR / "stability_field_level_overall_summary.csv",
+        index=False,
+    )
+
+    # Generate plots
+    generate_plots(
+        per_run_metric_df=per_run_metric_df,
+        per_run_with_overall_df=per_run_with_overall_df,
+        metric_stability_df=metric_stability_by_doc_type_df,
+        field_df=field_stability_df,
+        field_summary_df=field_summary_by_doc_type_df,
+    )
+
+    print("\nSaved CSV outputs to:")
+    print(OUTPUT_DIR.resolve())
+
+    print("\nSaved plots to:")
+    print(PLOT_DIR.resolve())
+
+
+if __name__ == "__main__":
+    run_stability_analysis()
