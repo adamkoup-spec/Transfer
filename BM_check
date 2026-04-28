@@ -2,8 +2,6 @@ import json
 import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from collections import defaultdict
-
 import pandas as pd
 import matplotlib.pyplot as plt
 
@@ -12,11 +10,9 @@ import matplotlib.pyplot as plt
 # CONFIG
 # =========================================================
 
-BENCHMARK_ROOT = Path("/path/to/benchmark_results")
-GROUND_TRUTH_ROOT = Path("/path/to/ground_truth")
+BENCHMARK_ROOT = Path(r"C:\path\to\benchmark_results")
+GROUND_TRUTH_ROOT = Path(r"C:\path\to\ground_truth")
 
-# Top-level folders under BENCHMARK_ROOT.
-# Rename these to your actual folder names.
 MODEL_ROOTS = {
     "Production": BENCHMARK_ROOT / "production",
     "LLM Pair 1": BENCHMARK_ROOT / "llm_pair_1",
@@ -35,31 +31,57 @@ MODEL_ORDER = [
     "LLM Pair 5",
 ]
 
-# Your three doc-type folders.
-# Replace A/B/C with actual folder names and routes.
+PRODUCTION_NAME = "Production"
+
 ROUTES_BY_FOLDER = {
     "A": "response.output",
     "B": "prediction.final",
     "C": "data.items",
 }
 
-# Optional custom rollup groups by doc type.
-# None = use top-level prefix as group.
-ROLLUP_GROUPS_BY_FOLDER = {
-    "A": None,
-    "B": None,
-    "C": None,
-}
+CONFIDENCE_THRESHOLDS = [0, 50, 60, 70, 80, 90, 95]
 
-CONFIDENCE_THRESHOLD = 80
 CONFIDENCE_IS_PROBABILITY = False
 
 STRIP_STRINGS = True
 CASE_INSENSITIVE_STRINGS = False
 
-PRODUCTION_NAME = "Production"
+# Manual corrections to naive exact-match correct count.
+# These are applied at model + doc_type + threshold summary level.
+MANUAL_CORRECT_OFFSET_BY_MODEL_AND_FOLDER = {
+    "Production": {
+        "A": 0,
+        "B": 0,
+        "C": 0,
+    },
+    "LLM Pair 1": {
+        "A": 0,
+        "B": 0,
+        "C": 0,
+    },
+    "LLM Pair 2": {
+        "A": 0,
+        "B": 0,
+        "C": 0,
+    },
+    "LLM Pair 3": {
+        "A": 0,
+        "B": 0,
+        "C": 0,
+    },
+    "LLM Pair 4": {
+        "A": 0,
+        "B": 0,
+        "C": 0,
+    },
+    "LLM Pair 5": {
+        "A": 0,
+        "B": 0,
+        "C": 0,
+    },
+}
 
-OUTPUT_DIR = Path("./benchmark_plots")
+OUTPUT_DIR = Path("./benchmark_output")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -83,11 +105,16 @@ def normalize_value(x: Any) -> Any:
 
 def get_by_route(obj: Any, route: str) -> Any:
     cur = obj
+
+    if route is None or route == "":
+        return cur
+
     for part in route.split("."):
         if isinstance(cur, dict):
             if part not in cur:
                 return None
             cur = cur[part]
+
         elif isinstance(cur, list):
             if not part.isdigit():
                 return None
@@ -95,8 +122,10 @@ def get_by_route(obj: Any, route: str) -> Any:
             if idx < 0 or idx >= len(cur):
                 return None
             cur = cur[idx]
+
         else:
             return None
+
     return cur
 
 
@@ -109,6 +138,7 @@ def list_relative_jsons(folder: Path) -> List[Path]:
 def coerce_confidence(x: Any) -> Optional[float]:
     if x is None:
         return None
+
     try:
         val = float(x)
     except Exception:
@@ -123,11 +153,37 @@ def coerce_confidence(x: Any) -> Optional[float]:
     return val
 
 
-def fbeta_score(accuracy: Optional[float], coverage: Optional[float], beta: float = 1.0) -> Optional[float]:
-    """
-    Harmonic mean of accuracy and coverage.
-    Treat accuracy like precision and coverage like recall.
-    """
+def find_all_confidences(obj: Any) -> List[float]:
+    confidences = []
+
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == "confidence":
+                c = coerce_confidence(v)
+                if c is not None:
+                    confidences.append(c)
+            else:
+                confidences.extend(find_all_confidences(v))
+
+    elif isinstance(obj, list):
+        for item in obj:
+            confidences.extend(find_all_confidences(item))
+
+    return confidences
+
+
+def extract_node_confidence(obj: Any) -> Optional[float]:
+    confidences = find_all_confidences(obj)
+    if not confidences:
+        return None
+    return max(confidences)
+
+
+def fbeta_score(
+    accuracy: Optional[float],
+    coverage: Optional[float],
+    beta: float = 1.0,
+) -> Optional[float]:
     if accuracy is None or coverage is None:
         return None
 
@@ -143,14 +199,35 @@ def fbeta_score(accuracy: Optional[float], coverage: Optional[float], beta: floa
     return (1 + beta2) * accuracy * coverage / denom
 
 
+def get_manual_correct_offset(model_name: str, doc_type: str) -> int:
+    return int(
+        MANUAL_CORRECT_OFFSET_BY_MODEL_AND_FOLDER
+        .get(model_name, {})
+        .get(doc_type, 0)
+    )
+
+
 # =========================================================
 # FLATTENING
 # =========================================================
 
-def flatten_prediction_value_paths(obj: Any, parent_key: str = "") -> Dict[str, Dict[str, Any]]:
+def flatten_prediction_value_paths(
+    obj: Any,
+    parent_key: str = "",
+) -> Dict[str, Dict[str, Any]]:
     """
-    Recursively finds every dict with key 'value'.
-    Also extracts confidence from sibling 'co-ords.confidence' if present.
+    Recursively finds every dict containing key 'value'.
+
+    Prediction output:
+    {
+        "address.city": {
+            "value": "Dallas",
+            "confidence": 91.0,
+            "has_confidence": True
+        }
+    }
+
+    Null is a real prediction value if the prediction node exists.
     """
     items = {}
 
@@ -158,28 +235,22 @@ def flatten_prediction_value_paths(obj: Any, parent_key: str = "") -> Dict[str, 
         if "value" in obj:
             clean_key = parent_key if parent_key else "value"
             raw_value = obj.get("value")
-            coords = obj.get("co-ords")
-
-            confidence = None
-            if isinstance(coords, dict):
-                confidence = coerce_confidence(coords.get("confidence"))
+            confidence = extract_node_confidence(obj)
 
             items[clean_key] = {
                 "value": normalize_value(raw_value),
                 "confidence": confidence,
-                "has_value": raw_value is not None,
                 "has_confidence": confidence is not None,
             }
 
         for k, v in obj.items():
             if k == "value":
                 continue
+
             new_key = f"{parent_key}.{k}" if parent_key else k
             items.update(flatten_prediction_value_paths(v, new_key))
 
     elif isinstance(obj, list):
-        # This compares lists by index.
-        # If lists are unordered, add matching/alignment before flattening.
         for i, v in enumerate(obj):
             new_key = f"{parent_key}.{i}" if parent_key else str(i)
             items.update(flatten_prediction_value_paths(v, new_key))
@@ -187,9 +258,12 @@ def flatten_prediction_value_paths(obj: Any, parent_key: str = "") -> Dict[str, 
     return items
 
 
-def flatten_gt_value_paths(obj: Any, parent_key: str = "") -> Dict[str, Any]:
+def flatten_gt_value_paths(
+    obj: Any,
+    parent_key: str = "",
+) -> Dict[str, Any]:
     """
-    Recursively finds every dict with key 'value' on GT side.
+    Recursively finds every dict containing key 'value' on GT side.
     """
     items = {}
 
@@ -201,6 +275,7 @@ def flatten_gt_value_paths(obj: Any, parent_key: str = "") -> Dict[str, Any]:
         for k, v in obj.items():
             if k == "value":
                 continue
+
             new_key = f"{parent_key}.{k}" if parent_key else k
             items.update(flatten_gt_value_paths(v, new_key))
 
@@ -213,266 +288,349 @@ def flatten_gt_value_paths(obj: Any, parent_key: str = "") -> Dict[str, Any]:
 
 
 # =========================================================
-# EVALUATION
+# STATUS / COVERAGE LOGIC
 # =========================================================
 
-def classify_prediction_status(pred_info: Optional[Dict[str, Any]], threshold: float) -> str:
+def classify_prediction_status(
+    pred_info: Optional[Dict[str, Any]],
+    threshold: float,
+) -> str:
+    """
+    Latest rule:
+
+    missing_pred:
+        prediction key/node does not exist
+        => not covered
+
+    explicit_low_conf:
+        prediction exists, confidence exists, confidence < threshold
+        => not covered
+
+    covered_with_confidence:
+        prediction exists, confidence exists, confidence >= threshold
+        => covered
+
+    covered_without_confidence:
+        prediction exists, confidence missing/null
+        => covered
+
+    This applies whether prediction value is null or non-null.
+    """
     if pred_info is None:
         return "missing_pred"
 
-    if not pred_info.get("has_value", False):
-        return "null_or_ignored"
-
     confidence = pred_info.get("confidence")
 
-    if confidence is None:
-        return "missing_confidence"
+    if confidence is not None and confidence < threshold:
+        return "explicit_low_conf"
 
-    if confidence < threshold:
-        return "low_conf"
+    if confidence is not None and confidence >= threshold:
+        return "covered_with_confidence"
 
-    return "evaluated"
-
-
-def infer_default_group(field_name: str) -> str:
-    return field_name.split(".")[0]
+    return "covered_without_confidence"
 
 
-def assign_group_for_field(field_name: str, configured_groups: Optional[List[str]]) -> str:
-    if configured_groups:
-        matches = [
-            g for g in configured_groups
-            if field_name == g or field_name.startswith(g + ".")
-        ]
-        if matches:
-            return max(matches, key=len)
-
-    return infer_default_group(field_name)
+def is_covered_status(status: str) -> bool:
+    return status in {
+        "covered_with_confidence",
+        "covered_without_confidence",
+    }
 
 
-def build_group_to_fields(
-    field_names: List[str],
-    configured_groups: Optional[List[str]],
-) -> Dict[str, List[str]]:
-    out = defaultdict(list)
-    for field in field_names:
-        group = assign_group_for_field(field, configured_groups)
-        out[group].append(field)
-    return dict(out)
+# =========================================================
+# EVALUATE ONE FILE
+# =========================================================
+
+def evaluate_one_file(
+    gt_flat: Dict[str, Any],
+    pred_flat: Dict[str, Dict[str, Any]],
+    threshold: float,
+) -> Dict[str, Any]:
+    """
+    Leaf-level only.
+
+    total:
+        all leaf fields appearing in GT or prediction.
+
+    covered:
+        prediction exists and is not explicitly low-confidence.
+
+    correct:
+        covered prediction value equals GT value.
+        Null is compared as a real value.
+    """
+    all_fields = sorted(set(gt_flat.keys()) | set(pred_flat.keys()))
+
+    total = len(all_fields)
+    covered = 0
+    correct = 0
+
+    missing_pred = 0
+    explicit_low_conf = 0
+    covered_with_confidence = 0
+    covered_without_confidence = 0
+
+    null_gt_fields = 0
+    null_pred_covered = 0
+    null_pred_correct = 0
+    prediction_only_fields = 0
+
+    for field in all_fields:
+        gt_present = field in gt_flat
+        pred_present = field in pred_flat
+
+        gt_val = gt_flat.get(field)
+        pred_info = pred_flat.get(field)
+        pred_val = pred_info.get("value") if pred_info is not None else None
+
+        if gt_present and gt_val is None:
+            null_gt_fields += 1
+
+        if pred_present and not gt_present:
+            prediction_only_fields += 1
+
+        status = classify_prediction_status(pred_info, threshold)
+
+        if is_covered_status(status):
+            covered += 1
+
+            if pred_val == gt_val:
+                correct += 1
+
+            if pred_val is None:
+                null_pred_covered += 1
+                if pred_val == gt_val:
+                    null_pred_correct += 1
+
+            if status == "covered_with_confidence":
+                covered_with_confidence += 1
+            elif status == "covered_without_confidence":
+                covered_without_confidence += 1
+
+        else:
+            if status == "missing_pred":
+                missing_pred += 1
+            elif status == "explicit_low_conf":
+                explicit_low_conf += 1
+
+    coverage = covered / total if total else None
+    accuracy = correct / covered if covered else None
+
+    return {
+        "total": total,
+        "covered": covered,
+        "correct": correct,
+        "coverage": coverage,
+        "accuracy": accuracy,
+        "f1_balanced_score": fbeta_score(accuracy, coverage, beta=1.0),
+        "f2_coverage_weighted_score": fbeta_score(accuracy, coverage, beta=2.0),
+
+        "missing_pred": missing_pred,
+        "explicit_low_conf": explicit_low_conf,
+        "covered_with_confidence": covered_with_confidence,
+        "covered_without_confidence": covered_without_confidence,
+
+        "null_gt_fields": null_gt_fields,
+        "null_pred_covered": null_pred_covered,
+        "null_pred_correct": null_pred_correct,
+        "prediction_only_fields": prediction_only_fields,
+    }
 
 
-def evaluate_model_root(
+# =========================================================
+# EVALUATE MODEL + DOC TYPE
+# =========================================================
+
+def evaluate_model_doc_type(
     model_name: str,
     model_root: Path,
     gt_root: Path,
-    routes_by_folder: Dict[str, str],
-    rollup_groups_by_folder: Dict[str, Optional[List[str]]],
+    doc_type: str,
+    route: str,
     threshold: float,
-) -> pd.DataFrame:
-    """
-    Returns one row per model + doc_type.
-    """
+) -> Dict[str, Any]:
+    result_folder = model_root / doc_type
+    gt_folder = gt_root / doc_type
+
+    result_files = set(list_relative_jsons(result_folder))
+    gt_files = set(list_relative_jsons(gt_folder))
+
+    # Start from model outputs only; ignore result files with no matching GT.
+    common_files = sorted([p for p in result_files if p in gt_files])
+
+    total = 0
+    covered = 0
+    correct_raw = 0
+
+    missing_pred = 0
+    explicit_low_conf = 0
+    covered_with_confidence = 0
+    covered_without_confidence = 0
+
+    null_gt_fields = 0
+    null_pred_covered = 0
+    null_pred_correct = 0
+    prediction_only_fields = 0
+
+    files_compared = 0
+    route_failures = 0
+    unreadable_files = 0
+
+    result_file_without_matching_gt_ignored = len(result_files - gt_files)
+    gt_file_without_matching_result_ignored = len(gt_files - result_files)
+
+    for rel_path in common_files:
+        pred_path = result_folder / rel_path
+        gt_path = gt_folder / rel_path
+
+        try:
+            pred_json = load_json(pred_path)
+            gt_json = load_json(gt_path)
+        except Exception:
+            unreadable_files += 1
+            continue
+
+        pred_subtree = get_by_route(pred_json, route)
+        gt_subtree = get_by_route(gt_json, route)
+
+        if pred_subtree is None or gt_subtree is None:
+            route_failures += 1
+            continue
+
+        pred_flat = flatten_prediction_value_paths(pred_subtree)
+        gt_flat = flatten_gt_value_paths(gt_subtree)
+
+        file_eval = evaluate_one_file(
+            gt_flat=gt_flat,
+            pred_flat=pred_flat,
+            threshold=threshold,
+        )
+
+        files_compared += 1
+
+        total += file_eval["total"]
+        covered += file_eval["covered"]
+        correct_raw += file_eval["correct"]
+
+        missing_pred += file_eval["missing_pred"]
+        explicit_low_conf += file_eval["explicit_low_conf"]
+        covered_with_confidence += file_eval["covered_with_confidence"]
+        covered_without_confidence += file_eval["covered_without_confidence"]
+
+        null_gt_fields += file_eval["null_gt_fields"]
+        null_pred_covered += file_eval["null_pred_covered"]
+        null_pred_correct += file_eval["null_pred_correct"]
+        prediction_only_fields += file_eval["prediction_only_fields"]
+
+    manual_offset = get_manual_correct_offset(model_name, doc_type)
+    correct = min(correct_raw + manual_offset, covered)
+
+    coverage = covered / total if total else None
+    accuracy = correct / covered if covered else None
+
+    return {
+        "model": model_name,
+        "doc_type": doc_type,
+        "threshold": threshold,
+        "files_compared": files_compared,
+
+        "result_file_without_matching_gt_ignored": result_file_without_matching_gt_ignored,
+        "gt_file_without_matching_result_ignored": gt_file_without_matching_result_ignored,
+        "route_failures": route_failures,
+        "unreadable_files": unreadable_files,
+
+        "total": total,
+        "covered": covered,
+        "correct_raw": correct_raw,
+        "correct_manual_offset": manual_offset,
+        "correct": correct,
+        "coverage": coverage,
+        "accuracy": accuracy,
+        "f1_balanced_score": fbeta_score(accuracy, coverage, beta=1.0),
+        "f2_coverage_weighted_score": fbeta_score(accuracy, coverage, beta=2.0),
+
+        "missing_pred": missing_pred,
+        "explicit_low_conf": explicit_low_conf,
+        "covered_with_confidence": covered_with_confidence,
+        "covered_without_confidence": covered_without_confidence,
+
+        "null_gt_fields": null_gt_fields,
+        "null_pred_covered": null_pred_covered,
+        "null_pred_correct": null_pred_correct,
+        "prediction_only_fields": prediction_only_fields,
+    }
+
+
+# =========================================================
+# BUILD TABLES
+# =========================================================
+
+def evaluate_all_models() -> pd.DataFrame:
     rows = []
 
-    for folder_name, route in routes_by_folder.items():
-        result_folder = model_root / folder_name
-        gt_folder = gt_root / folder_name
+    for threshold in CONFIDENCE_THRESHOLDS:
+        print(f"\n=== Threshold: {threshold} ===")
 
-        result_files = set(list_relative_jsons(result_folder))
-        gt_files = set(list_relative_jsons(gt_folder))
-        common_files = sorted(result_files & gt_files)
+        for model_name, model_root in MODEL_ROOTS.items():
+            print(f"Model: {model_name}")
 
-        child_total = 0
-        child_evaluated = 0
-        child_correct = 0
-
-        rollup_total = 0
-        rollup_covered = 0
-        rollup_correct = 0
-
-        files_compared = 0
-        missing_in_gt = len(result_files - gt_files)
-        missing_in_prediction = len(gt_files - result_files)
-
-        route_failures = 0
-        unreadable_files = 0
-
-        for rel_path in common_files:
-            pred_path = result_folder / rel_path
-            gt_path = gt_folder / rel_path
-
-            try:
-                pred_json = load_json(pred_path)
-                gt_json = load_json(gt_path)
-            except Exception:
-                unreadable_files += 1
-                continue
-
-            pred_subtree = get_by_route(pred_json, route)
-            gt_subtree = get_by_route(gt_json, route)
-
-            if pred_subtree is None or gt_subtree is None:
-                route_failures += 1
-                continue
-
-            pred_flat = flatten_prediction_value_paths(pred_subtree)
-            gt_flat = flatten_gt_value_paths(gt_subtree)
-
-            all_fields = sorted(set(gt_flat.keys()) | set(pred_flat.keys()))
-
-            # Important: only non-null GT fields are in denominator
-            valid_fields = [f for f in all_fields if gt_flat.get(f) is not None]
-
-            if not valid_fields:
-                continue
-
-            files_compared += 1
-
-            # -----------------------------
-            # Child-level metrics
-            # -----------------------------
-            for field in valid_fields:
-                gt_val = gt_flat.get(field)
-                pred_info = pred_flat.get(field)
-                status = classify_prediction_status(pred_info, threshold)
-
-                child_total += 1
-
-                if status == "evaluated":
-                    child_evaluated += 1
-                    if pred_info["value"] == gt_val:
-                        child_correct += 1
-
-            # -----------------------------
-            # Rollup metrics
-            # -----------------------------
-            configured_groups = rollup_groups_by_folder.get(folder_name)
-            group_to_fields = build_group_to_fields(valid_fields, configured_groups)
-
-            for group, fields in group_to_fields.items():
-                rollup_total += 1
-
-                all_evaluated = True
-                all_correct = True
-
-                for field in fields:
-                    gt_val = gt_flat.get(field)
-                    pred_info = pred_flat.get(field)
-                    status = classify_prediction_status(pred_info, threshold)
-
-                    if status != "evaluated":
-                        all_evaluated = False
-                        all_correct = False
-                    else:
-                        if pred_info["value"] != gt_val:
-                            all_correct = False
-
-                if all_evaluated:
-                    rollup_covered += 1
-                    if all_correct:
-                        rollup_correct += 1
-
-        child_coverage_rate = child_evaluated / child_total if child_total else None
-        child_accuracy = child_correct / child_evaluated if child_evaluated else None
-        child_f1 = fbeta_score(child_accuracy, child_coverage_rate, beta=1.0)
-        child_f2 = fbeta_score(child_accuracy, child_coverage_rate, beta=2.0)
-
-        rollup_coverage_rate = rollup_covered / rollup_total if rollup_total else None
-        rollup_accuracy = rollup_correct / rollup_covered if rollup_covered else None
-        rollup_f1 = fbeta_score(rollup_accuracy, rollup_coverage_rate, beta=1.0)
-        rollup_f2 = fbeta_score(rollup_accuracy, rollup_coverage_rate, beta=2.0)
-
-        rows.append({
-            "model": model_name,
-            "doc_type": folder_name,
-            "files_compared": files_compared,
-            "missing_in_gt": missing_in_gt,
-            "missing_in_prediction": missing_in_prediction,
-            "route_failures": route_failures,
-            "unreadable_files": unreadable_files,
-
-            "child_total": child_total,
-            "child_evaluated": child_evaluated,
-            "child_correct": child_correct,
-            "child_coverage_rate": child_coverage_rate,
-            "child_accuracy": child_accuracy,
-            "child_f1_balanced_score": child_f1,
-            "child_f2_coverage_weighted_score": child_f2,
-
-            "rollup_total": rollup_total,
-            "rollup_covered": rollup_covered,
-            "rollup_correct": rollup_correct,
-            "rollup_coverage_rate": rollup_coverage_rate,
-            "rollup_accuracy": rollup_accuracy,
-            "rollup_f1_balanced_score": rollup_f1,
-            "rollup_f2_coverage_weighted_score": rollup_f2,
-        })
+            for doc_type, route in ROUTES_BY_FOLDER.items():
+                row = evaluate_model_doc_type(
+                    model_name=model_name,
+                    model_root=model_root,
+                    gt_root=GROUND_TRUTH_ROOT,
+                    doc_type=doc_type,
+                    route=route,
+                    threshold=threshold,
+                )
+                rows.append(row)
 
     return pd.DataFrame(rows)
 
 
-def evaluate_all_models() -> pd.DataFrame:
-    frames = []
-
-    for model_name, model_root in MODEL_ROOTS.items():
-        df = evaluate_model_root(
-            model_name=model_name,
-            model_root=model_root,
-            gt_root=GROUND_TRUTH_ROOT,
-            routes_by_folder=ROUTES_BY_FOLDER,
-            rollup_groups_by_folder=ROLLUP_GROUPS_BY_FOLDER,
-            threshold=CONFIDENCE_THRESHOLD,
-        )
-        frames.append(df)
-
-    return pd.concat(frames, ignore_index=True)
-
-
-# =========================================================
-# OVERALL + DELTAS + RANKING
-# =========================================================
-
-def build_overall_metrics(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Micro-averaged overall metrics across doc types.
-    """
+def build_overall_metrics(by_doc_type_df: pd.DataFrame) -> pd.DataFrame:
     rows = []
 
-    for model_name, g in df.groupby("model"):
-        child_total = g["child_total"].sum()
-        child_evaluated = g["child_evaluated"].sum()
-        child_correct = g["child_correct"].sum()
+    for (model_name, threshold), g in by_doc_type_df.groupby(["model", "threshold"], dropna=False):
+        total = int(g["total"].sum())
+        covered = int(g["covered"].sum())
+        correct_raw = int(g["correct_raw"].sum())
+        correct_manual_offset = int(g["correct_manual_offset"].sum())
+        correct = int(g["correct"].sum())
 
-        rollup_total = g["rollup_total"].sum()
-        rollup_covered = g["rollup_covered"].sum()
-        rollup_correct = g["rollup_correct"].sum()
-
-        child_coverage = child_evaluated / child_total if child_total else None
-        child_accuracy = child_correct / child_evaluated if child_evaluated else None
-
-        rollup_coverage = rollup_covered / rollup_total if rollup_total else None
-        rollup_accuracy = rollup_correct / rollup_covered if rollup_covered else None
+        coverage = covered / total if total else None
+        accuracy = correct / covered if covered else None
 
         rows.append({
             "model": model_name,
             "doc_type": "OVERALL",
-            "files_compared": g["files_compared"].sum(),
+            "threshold": threshold,
+            "files_compared": int(g["files_compared"].sum()),
 
-            "child_total": child_total,
-            "child_evaluated": child_evaluated,
-            "child_correct": child_correct,
-            "child_coverage_rate": child_coverage,
-            "child_accuracy": child_accuracy,
-            "child_f1_balanced_score": fbeta_score(child_accuracy, child_coverage, beta=1.0),
-            "child_f2_coverage_weighted_score": fbeta_score(child_accuracy, child_coverage, beta=2.0),
+            "result_file_without_matching_gt_ignored": int(g["result_file_without_matching_gt_ignored"].sum()),
+            "gt_file_without_matching_result_ignored": int(g["gt_file_without_matching_result_ignored"].sum()),
+            "route_failures": int(g["route_failures"].sum()),
+            "unreadable_files": int(g["unreadable_files"].sum()),
 
-            "rollup_total": rollup_total,
-            "rollup_covered": rollup_covered,
-            "rollup_correct": rollup_correct,
-            "rollup_coverage_rate": rollup_coverage,
-            "rollup_accuracy": rollup_accuracy,
-            "rollup_f1_balanced_score": fbeta_score(rollup_accuracy, rollup_coverage, beta=1.0),
-            "rollup_f2_coverage_weighted_score": fbeta_score(rollup_accuracy, rollup_coverage, beta=2.0),
+            "total": total,
+            "covered": covered,
+            "correct_raw": correct_raw,
+            "correct_manual_offset": correct_manual_offset,
+            "correct": correct,
+            "coverage": coverage,
+            "accuracy": accuracy,
+            "f1_balanced_score": fbeta_score(accuracy, coverage, beta=1.0),
+            "f2_coverage_weighted_score": fbeta_score(accuracy, coverage, beta=2.0),
+
+            "missing_pred": int(g["missing_pred"].sum()),
+            "explicit_low_conf": int(g["explicit_low_conf"].sum()),
+            "covered_with_confidence": int(g["covered_with_confidence"].sum()),
+            "covered_without_confidence": int(g["covered_without_confidence"].sum()),
+
+            "null_gt_fields": int(g["null_gt_fields"].sum()),
+            "null_pred_covered": int(g["null_pred_covered"].sum()),
+            "null_pred_correct": int(g["null_pred_correct"].sum()),
+            "prediction_only_fields": int(g["prediction_only_fields"].sum()),
         })
 
     return pd.DataFrame(rows)
@@ -483,25 +641,21 @@ def add_delta_vs_production(
     production_name: str = PRODUCTION_NAME,
 ) -> pd.DataFrame:
     metrics = [
-        "child_coverage_rate",
-        "child_accuracy",
-        "child_f1_balanced_score",
-        "child_f2_coverage_weighted_score",
-        "rollup_coverage_rate",
-        "rollup_accuracy",
-        "rollup_f1_balanced_score",
-        "rollup_f2_coverage_weighted_score",
+        "coverage",
+        "accuracy",
+        "f1_balanced_score",
+        "f2_coverage_weighted_score",
     ]
 
     out = df.copy()
 
     base = (
         out[out["model"] == production_name]
-        [["doc_type"] + metrics]
+        [["doc_type", "threshold"] + metrics]
         .rename(columns={m: f"{m}_production" for m in metrics})
     )
 
-    out = out.merge(base, on="doc_type", how="left")
+    out = out.merge(base, on=["doc_type", "threshold"], how="left")
 
     for m in metrics:
         out[f"{m}_delta_vs_production"] = out[m] - out[f"{m}_production"]
@@ -513,24 +667,25 @@ def add_delta_vs_production(
 
 
 def build_ranking_table(overall_df: pd.DataFrame) -> pd.DataFrame:
-    rank_cols = [
-        "child_f1_balanced_score",
-        "child_f2_coverage_weighted_score",
-        "rollup_f1_balanced_score",
-        "rollup_f2_coverage_weighted_score",
-        "child_accuracy",
-        "child_coverage_rate",
-    ]
-
     out = overall_df.copy()
 
-    for col in rank_cols:
-        out[f"{col}_rank"] = out[col].rank(ascending=False, method="min")
+    rank_cols = [
+        "f1_balanced_score",
+        "f2_coverage_weighted_score",
+        "accuracy",
+        "coverage",
+    ]
 
-    # Main suggested rank: child F1 first, child F2 second, rollup F1 third
+    for col in rank_cols:
+        out[f"{col}_rank"] = (
+            out.groupby("threshold")[col]
+            .rank(ascending=False, method="min")
+        )
+
     out = out.sort_values(
-        ["child_f1_balanced_score", "child_f2_coverage_weighted_score", "rollup_f1_balanced_score"],
-        ascending=[False, False, False],
+        ["threshold", "f1_balanced_score", "f2_coverage_weighted_score", "accuracy", "coverage"],
+        ascending=[True, False, False, False, False],
+        na_position="last",
     ).reset_index(drop=True)
 
     return out
@@ -540,20 +695,33 @@ def build_ranking_table(overall_df: pd.DataFrame) -> pd.DataFrame:
 # PLOTTING
 # =========================================================
 
-def ordered_models_present(df: pd.DataFrame) -> List[str]:
-    return [m for m in MODEL_ORDER if m in set(df["model"])]
+def get_model_order_present(df: pd.DataFrame) -> List[str]:
+    present = set(df["model"])
+    return [m for m in MODEL_ORDER if m in present]
 
 
 def plot_metric_by_doc_type(
     df: pd.DataFrame,
     metric: str,
+    threshold: float,
     title: str,
     output_path: Path,
 ) -> None:
-    pivot = df.pivot(index="doc_type", columns="model", values=metric)
+    plot_source = df[df["threshold"] == threshold].copy()
+    plot_source[metric] = pd.to_numeric(plot_source[metric], errors="coerce")
+
+    if plot_source[metric].dropna().empty:
+        print(f"SKIP plot: {metric} at threshold {threshold} has no numeric data.")
+        return
+
+    pivot = plot_source.pivot(index="doc_type", columns="model", values=metric)
 
     cols = [m for m in MODEL_ORDER if m in pivot.columns]
     pivot = pivot[cols]
+
+    if pivot.dropna(how="all").empty:
+        print(f"SKIP plot: {metric} at threshold {threshold} pivot is empty.")
+        return
 
     ax = pivot.plot(kind="bar", figsize=(13, 6))
     ax.set_title(title)
@@ -569,11 +737,20 @@ def plot_metric_by_doc_type(
 def plot_overall_metric(
     overall_df: pd.DataFrame,
     metric: str,
+    threshold: float,
     title: str,
     output_path: Path,
 ) -> None:
-    plot_df = overall_df.set_index("model")
-    plot_df = plot_df.loc[[m for m in MODEL_ORDER if m in plot_df.index]]
+    plot_df = overall_df[overall_df["threshold"] == threshold].copy()
+    plot_df[metric] = pd.to_numeric(plot_df[metric], errors="coerce")
+
+    if plot_df[metric].dropna().empty:
+        print(f"SKIP overall plot: {metric} at threshold {threshold} has no numeric data.")
+        return
+
+    plot_df = plot_df.set_index("model")
+    order = [m for m in MODEL_ORDER if m in plot_df.index]
+    plot_df = plot_df.loc[order]
 
     ax = plot_df[metric].plot(kind="bar", figsize=(11, 5))
     ax.set_title(title)
@@ -585,58 +762,57 @@ def plot_overall_metric(
     plt.close()
 
 
-def plot_delta_vs_production(
-    delta_df: pd.DataFrame,
-    metric_delta: str,
-    title: str,
+def plot_coverage_accuracy_scatter(
+    overall_df: pd.DataFrame,
+    threshold: float,
     output_path: Path,
 ) -> None:
-    plot_df = delta_df[delta_df["model"] != PRODUCTION_NAME].copy()
+    plot_df = overall_df[overall_df["threshold"] == threshold].copy()
 
-    pivot = plot_df.pivot(index="doc_type", columns="model", values=metric_delta)
-    cols = [m for m in MODEL_ORDER if m != PRODUCTION_NAME and m in pivot.columns]
-    pivot = pivot[cols]
+    fig, ax = plt.subplots(figsize=(8, 6))
 
-    ax = pivot.plot(kind="bar", figsize=(13, 6))
-    ax.axhline(0, linewidth=1)
-    ax.set_title(title)
-    ax.set_xlabel("Doc Type")
-    ax.set_ylabel("Delta vs Production")
-    ax.legend(title="Model", bbox_to_anchor=(1.02, 1), loc="upper left")
+    for _, row in plot_df.iterrows():
+        x = row["coverage"]
+        y = row["accuracy"]
+
+        if pd.isna(x) or pd.isna(y):
+            continue
+
+        ax.scatter(x, y)
+        ax.annotate(row["model"], (x, y), xytext=(5, 5), textcoords="offset points")
+
+    ax.set_title(f"Overall Accuracy vs Coverage at Threshold {threshold}")
+    ax.set_xlabel("Coverage")
+    ax.set_ylabel("Accuracy")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
     plt.close()
 
 
-def plot_coverage_accuracy_scatter(
+def plot_threshold_curve(
     overall_df: pd.DataFrame,
+    metric: str,
     output_path: Path,
-    use_rollup: bool = False,
 ) -> None:
-    if use_rollup:
-        coverage_col = "rollup_coverage_rate"
-        accuracy_col = "rollup_accuracy"
-        title = "Overall Rollup Accuracy vs Coverage Rate"
-    else:
-        coverage_col = "child_coverage_rate"
-        accuracy_col = "child_accuracy"
-        title = "Overall Child-Level Accuracy vs Coverage Rate"
+    pivot = overall_df.pivot(index="threshold", columns="model", values=metric)
 
-    fig, ax = plt.subplots(figsize=(8, 6))
+    cols = [m for m in MODEL_ORDER if m in pivot.columns]
+    pivot = pivot[cols]
 
-    for _, row in overall_df.iterrows():
-        x = row[coverage_col]
-        y = row[accuracy_col]
-        if pd.isna(x) or pd.isna(y):
-            continue
-        ax.scatter(x, y)
-        ax.annotate(row["model"], (x, y), xytext=(5, 5), textcoords="offset points")
+    if pivot.dropna(how="all").empty:
+        print(f"SKIP threshold curve: {metric} has no numeric data.")
+        return
 
-    ax.set_title(title)
-    ax.set_xlabel("Coverage Rate")
-    ax.set_ylabel("Accuracy")
-    ax.set_xlim(0, 1)
+    ax = pivot.plot(kind="line", marker="o", figsize=(11, 6))
+    ax.set_title(f"Overall {metric.replace('_', ' ').title()} Across Thresholds")
+    ax.set_xlabel("Confidence Threshold")
+    ax.set_ylabel(metric.replace("_", " ").title())
     ax.set_ylim(0, 1)
+    ax.legend(title="Model", bbox_to_anchor=(1.02, 1), loc="upper left")
+
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
     plt.close()
@@ -646,120 +822,121 @@ def plot_coverage_accuracy_scatter(
 # MAIN
 # =========================================================
 
-if __name__ == "__main__":
+def run_benchmark_analysis() -> None:
     by_doc_type_df = evaluate_all_models()
-    by_doc_type_df.to_csv(OUTPUT_DIR / "benchmark_metrics_by_doc_type.csv", index=False)
+
+    by_doc_type_out = OUTPUT_DIR / "benchmark_metrics_by_doc_type_all_thresholds.csv"
+    by_doc_type_df.to_csv(by_doc_type_out, index=False)
+    print(f"Saved {by_doc_type_out}")
 
     overall_df = build_overall_metrics(by_doc_type_df)
-    overall_df.to_csv(OUTPUT_DIR / "benchmark_metrics_overall.csv", index=False)
+
+    overall_out = OUTPUT_DIR / "benchmark_metrics_overall_all_thresholds.csv"
+    overall_df.to_csv(overall_out, index=False)
+    print(f"Saved {overall_out}")
 
     by_doc_type_delta_df = add_delta_vs_production(by_doc_type_df, production_name=PRODUCTION_NAME)
-    by_doc_type_delta_df.to_csv(OUTPUT_DIR / "benchmark_delta_vs_production_by_doc_type.csv", index=False)
+
+    by_doc_type_delta_out = OUTPUT_DIR / "benchmark_delta_vs_production_by_doc_type_all_thresholds.csv"
+    by_doc_type_delta_df.to_csv(by_doc_type_delta_out, index=False)
+    print(f"Saved {by_doc_type_delta_out}")
 
     overall_delta_df = add_delta_vs_production(overall_df, production_name=PRODUCTION_NAME)
-    overall_delta_df.to_csv(OUTPUT_DIR / "benchmark_delta_vs_production_overall.csv", index=False)
+
+    overall_delta_out = OUTPUT_DIR / "benchmark_delta_vs_production_overall_all_thresholds.csv"
+    overall_delta_df.to_csv(overall_delta_out, index=False)
+    print(f"Saved {overall_delta_out}")
 
     ranking_df = build_ranking_table(overall_df)
-    ranking_df.to_csv(OUTPUT_DIR / "benchmark_model_ranking.csv", index=False)
 
-    # Plots by doc type
+    ranking_out = OUTPUT_DIR / "benchmark_model_ranking_all_thresholds.csv"
+    ranking_df.to_csv(ranking_out, index=False)
+    print(f"Saved {ranking_out}")
+
+    # Pick one default threshold for bar plots, usually 80
+    default_threshold = 80
+
     plot_metric_by_doc_type(
         by_doc_type_df,
-        metric="child_accuracy",
-        title=f"Child-Level Accuracy by Doc Type at Confidence ≥ {CONFIDENCE_THRESHOLD}",
-        output_path=OUTPUT_DIR / "benchmark_child_accuracy_by_doc_type.png",
+        metric="coverage",
+        threshold=default_threshold,
+        title=f"Coverage by Doc Type at Threshold {default_threshold}",
+        output_path=OUTPUT_DIR / f"benchmark_coverage_by_doc_type_t{default_threshold}.png",
     )
 
     plot_metric_by_doc_type(
         by_doc_type_df,
-        metric="child_coverage_rate",
-        title=f"Child-Level Coverage Rate by Doc Type at Confidence ≥ {CONFIDENCE_THRESHOLD}",
-        output_path=OUTPUT_DIR / "benchmark_child_coverage_by_doc_type.png",
+        metric="accuracy",
+        threshold=default_threshold,
+        title=f"Accuracy by Doc Type at Threshold {default_threshold}",
+        output_path=OUTPUT_DIR / f"benchmark_accuracy_by_doc_type_t{default_threshold}.png",
     )
 
     plot_metric_by_doc_type(
         by_doc_type_df,
-        metric="child_f1_balanced_score",
-        title=f"Child-Level Balanced Score by Doc Type at Confidence ≥ {CONFIDENCE_THRESHOLD}",
-        output_path=OUTPUT_DIR / "benchmark_child_f1_by_doc_type.png",
+        metric="f1_balanced_score",
+        threshold=default_threshold,
+        title=f"Balanced Score by Doc Type at Threshold {default_threshold}",
+        output_path=OUTPUT_DIR / f"benchmark_f1_by_doc_type_t{default_threshold}.png",
     )
 
     plot_metric_by_doc_type(
         by_doc_type_df,
-        metric="child_f2_coverage_weighted_score",
-        title=f"Child-Level Coverage-Weighted Score by Doc Type at Confidence ≥ {CONFIDENCE_THRESHOLD}",
-        output_path=OUTPUT_DIR / "benchmark_child_f2_by_doc_type.png",
-    )
-
-    plot_metric_by_doc_type(
-        by_doc_type_df,
-        metric="rollup_accuracy",
-        title=f"Rollup Accuracy by Doc Type at Confidence ≥ {CONFIDENCE_THRESHOLD}",
-        output_path=OUTPUT_DIR / "benchmark_rollup_accuracy_by_doc_type.png",
-    )
-
-    plot_metric_by_doc_type(
-        by_doc_type_df,
-        metric="rollup_coverage_rate",
-        title=f"Rollup Coverage Rate by Doc Type at Confidence ≥ {CONFIDENCE_THRESHOLD}",
-        output_path=OUTPUT_DIR / "benchmark_rollup_coverage_by_doc_type.png",
-    )
-
-    # Overall plots
-    plot_overall_metric(
-        overall_df,
-        metric="child_f1_balanced_score",
-        title="Overall Child-Level Balanced Score",
-        output_path=OUTPUT_DIR / "benchmark_overall_child_f1.png",
+        metric="f2_coverage_weighted_score",
+        threshold=default_threshold,
+        title=f"Coverage-Weighted Score by Doc Type at Threshold {default_threshold}",
+        output_path=OUTPUT_DIR / f"benchmark_f2_by_doc_type_t{default_threshold}.png",
     )
 
     plot_overall_metric(
         overall_df,
-        metric="child_f2_coverage_weighted_score",
-        title="Overall Child-Level Coverage-Weighted Score",
-        output_path=OUTPUT_DIR / "benchmark_overall_child_f2.png",
+        metric="f1_balanced_score",
+        threshold=default_threshold,
+        title=f"Overall Balanced Score at Threshold {default_threshold}",
+        output_path=OUTPUT_DIR / f"benchmark_overall_f1_t{default_threshold}.png",
     )
 
     plot_overall_metric(
         overall_df,
-        metric="rollup_f1_balanced_score",
-        title="Overall Rollup Balanced Score",
-        output_path=OUTPUT_DIR / "benchmark_overall_rollup_f1.png",
-    )
-
-    # Delta vs production plots
-    plot_delta_vs_production(
-        by_doc_type_delta_df,
-        metric_delta="child_f1_balanced_score_delta_vs_production",
-        title="Child-Level Balanced Score Delta vs Production",
-        output_path=OUTPUT_DIR / "benchmark_child_f1_delta_vs_production.png",
-    )
-
-    plot_delta_vs_production(
-        by_doc_type_delta_df,
-        metric_delta="child_accuracy_delta_vs_production",
-        title="Child-Level Accuracy Delta vs Production",
-        output_path=OUTPUT_DIR / "benchmark_child_accuracy_delta_vs_production.png",
-    )
-
-    plot_delta_vs_production(
-        by_doc_type_delta_df,
-        metric_delta="child_coverage_rate_delta_vs_production",
-        title="Child-Level Coverage Rate Delta vs Production",
-        output_path=OUTPUT_DIR / "benchmark_child_coverage_delta_vs_production.png",
-    )
-
-    # Scatter plots
-    plot_coverage_accuracy_scatter(
-        overall_df,
-        output_path=OUTPUT_DIR / "benchmark_overall_child_accuracy_vs_coverage.png",
-        use_rollup=False,
+        metric="f2_coverage_weighted_score",
+        threshold=default_threshold,
+        title=f"Overall Coverage-Weighted Score at Threshold {default_threshold}",
+        output_path=OUTPUT_DIR / f"benchmark_overall_f2_t{default_threshold}.png",
     )
 
     plot_coverage_accuracy_scatter(
         overall_df,
-        output_path=OUTPUT_DIR / "benchmark_overall_rollup_accuracy_vs_coverage.png",
-        use_rollup=True,
+        threshold=default_threshold,
+        output_path=OUTPUT_DIR / f"benchmark_accuracy_vs_coverage_t{default_threshold}.png",
     )
 
-    print(f"Saved benchmark outputs to: {OUTPUT_DIR.resolve()}")
+    # Threshold curves
+    plot_threshold_curve(
+        overall_df,
+        metric="coverage",
+        output_path=OUTPUT_DIR / "benchmark_overall_coverage_across_thresholds.png",
+    )
+
+    plot_threshold_curve(
+        overall_df,
+        metric="accuracy",
+        output_path=OUTPUT_DIR / "benchmark_overall_accuracy_across_thresholds.png",
+    )
+
+    plot_threshold_curve(
+        overall_df,
+        metric="f1_balanced_score",
+        output_path=OUTPUT_DIR / "benchmark_overall_f1_across_thresholds.png",
+    )
+
+    plot_threshold_curve(
+        overall_df,
+        metric="f2_coverage_weighted_score",
+        output_path=OUTPUT_DIR / "benchmark_overall_f2_across_thresholds.png",
+    )
+
+    print(f"\nSaved benchmark outputs to: {OUTPUT_DIR.resolve()}")
+
+
+if __name__ == "__main__":
+    run_benchmark_analysis()
