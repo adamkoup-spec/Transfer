@@ -2,7 +2,6 @@ import json
 import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from collections import defaultdict
 import pandas as pd
 
 
@@ -19,22 +18,26 @@ ROUTES_BY_FOLDER = {
     "C": "data.items",
 }
 
-# Optional rollup groups.
-# None = use top-level parent as group.
-# Example: "A": ["address", "name", "business_info"]
-ROLLUP_GROUPS_BY_FOLDER = {
-    "A": None,
-    "B": None,
-    "C": None,
-}
+# Try multiple thresholds
+CONFIDENCE_THRESHOLDS = [0, 50, 60, 70, 80, 90, 95]
 
-CONFIDENCE_THRESHOLD = 80
+# If confidence is 0-1 instead of 0-100, set True
 CONFIDENCE_IS_PROBABILITY = False
 
 STRIP_STRINGS = True
 CASE_INSENSITIVE_STRINGS = False
 
-OUTPUT_DIR = Path("./performance_metrics_output")
+# Manual corrections to naive exact-match correct count by doc type.
+# Applied at summary level for each threshold.
+MANUAL_CORRECT_OFFSET_BY_FOLDER = {
+    "A": 0,
+    "B": 0,
+    "C": 0,
+    # Example:
+    # "business_address": 5,
+}
+
+OUTPUT_DIR = Path("./performance_metrics_thresholds_output")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -58,7 +61,7 @@ def normalize_value(x: Any) -> Any:
 
 def get_by_route(obj: Any, route: str) -> Any:
     """
-    Supports dotted paths:
+    Supports dotted routes:
       a.b.c
       items.0.name
     """
@@ -113,7 +116,7 @@ def coerce_confidence(x: Any) -> Optional[float]:
 
 def find_all_confidences(obj: Any) -> List[float]:
     """
-    Recursively find all keys named 'confidence' under a node.
+    Recursively find all keys named 'confidence' under a prediction node.
     """
     confidences = []
 
@@ -135,7 +138,7 @@ def find_all_confidences(obj: Any) -> List[float]:
 
 def extract_node_confidence(obj: Any) -> Optional[float]:
     """
-    For a prediction node containing 'value', find any confidence under that same node.
+    For a prediction node containing 'value', find any confidence inside that node.
     If multiple confidence values exist, use max.
     """
     confidences = find_all_confidences(obj)
@@ -151,8 +154,8 @@ def fbeta_score(
 ) -> Optional[float]:
     """
     Harmonic mean of accuracy and coverage.
-    beta=1 gives balanced score.
-    beta=2 weights coverage more heavily.
+    beta=1: balanced.
+    beta=2: coverage-weighted.
     """
     if accuracy is None or coverage is None:
         return None
@@ -180,7 +183,7 @@ def flatten_prediction_value_paths(
     """
     Recursively finds every dict containing key 'value'.
 
-    Output example:
+    Prediction output:
     {
         "address.city": {
             "value": "Dallas",
@@ -194,7 +197,7 @@ def flatten_prediction_value_paths(
         }
     }
 
-    Important:
+    Notes:
     - value can be None and still counts as a returned prediction.
     - confidence is only used to exclude explicitly low-confidence predictions.
     """
@@ -234,7 +237,7 @@ def flatten_gt_value_paths(
     """
     Recursively finds every dict containing key 'value' on GT side.
 
-    Output example:
+    GT output:
     {
         "address.city": "Dallas",
         "middle_name": None
@@ -273,19 +276,19 @@ def classify_prediction_status(
     """
     Latest rule:
 
-    - missing_pred:
+    missing_pred:
         prediction key/node does not exist
         => not covered
 
-    - explicit_low_conf:
+    explicit_low_conf:
         prediction exists, confidence exists, confidence < threshold
         => not covered
 
-    - covered_with_confidence:
+    covered_with_confidence:
         prediction exists, confidence exists, confidence >= threshold
         => covered
 
-    - covered_without_confidence:
+    covered_without_confidence:
         prediction exists, confidence missing/null
         => covered
 
@@ -313,79 +316,32 @@ def is_covered_status(status: str) -> bool:
 
 
 # =========================================================
-# ROLLUP GROUPING
-# =========================================================
-
-def infer_default_group(field_name: str) -> str:
-    """
-    Examples:
-      address.street -> address
-      person.name.first -> person
-      entity_name -> entity_name
-    """
-    return field_name.split(".")[0]
-
-
-def assign_group_for_field(
-    field_name: str,
-    configured_groups: Optional[List[str]],
-) -> str:
-    """
-    If configured_groups are provided, assign the most specific matching prefix.
-    Otherwise use top-level prefix.
-    """
-    if configured_groups:
-        matches = [
-            g for g in configured_groups
-            if field_name == g or field_name.startswith(g + ".")
-        ]
-        if matches:
-            return max(matches, key=len)
-
-    return infer_default_group(field_name)
-
-
-def build_group_to_fields(
-    field_names: List[str],
-    configured_groups: Optional[List[str]],
-) -> Dict[str, List[str]]:
-    out = defaultdict(list)
-
-    for field in field_names:
-        group = assign_group_for_field(field, configured_groups)
-        out[group].append(field)
-
-    return dict(out)
-
-
-# =========================================================
 # EVALUATE ONE FILE
 # =========================================================
 
 def evaluate_one_file(
     gt_flat: Dict[str, Any],
     pred_flat: Dict[str, Dict[str, Any]],
-    configured_groups: Optional[List[str]],
     threshold: float,
 ) -> Dict[str, Any]:
     """
-    Field-level evaluation:
-      denominator = all GT fields + prediction-only fields
-      covered = prediction exists and is not explicitly low confidence
-      accuracy = correct among covered
+    Leaf-level only.
 
-    This means:
-      GT null vs pred null = correct if pred is covered
-      GT non-null vs pred null = wrong if pred is covered
-      GT null vs pred non-null = wrong if pred is covered
-      pred confidence below threshold = not covered, excluded from accuracy
-      pred missing = not covered
+    total:
+        all leaf fields appearing in GT or prediction.
+
+    covered:
+        prediction exists and is not explicitly low confidence.
+
+    correct:
+        covered prediction value equals GT value.
+        Null is compared as a real value.
     """
     all_fields = sorted(set(gt_flat.keys()) | set(pred_flat.keys()))
 
-    child_total = len(all_fields)
-    child_covered = 0
-    child_correct = 0
+    total = len(all_fields)
+    covered = 0
+    correct = 0
 
     missing_pred = 0
     explicit_low_conf = 0
@@ -415,16 +371,16 @@ def evaluate_one_file(
             prediction_only_fields += 1
 
         status = classify_prediction_status(pred_info, threshold)
-        covered = is_covered_status(status)
+        is_covered = is_covered_status(status)
 
         match = None
 
-        if covered:
-            child_covered += 1
+        if is_covered:
+            covered += 1
             match = pred_val == gt_val
 
             if match:
-                child_correct += 1
+                correct += 1
 
             if pred_val is None:
                 null_pred_covered += 1
@@ -449,71 +405,21 @@ def evaluate_one_file(
             "pred_value": pred_val,
             "confidence": confidence,
             "status": status,
-            "covered": covered,
+            "covered": is_covered,
             "match": match,
         }
 
-    child_coverage_rate = child_covered / child_total if child_total else None
-    child_accuracy = child_correct / child_covered if child_covered else None
-
-    # -----------------------------
-    # Rollup evaluation
-    # -----------------------------
-    group_to_fields = build_group_to_fields(all_fields, configured_groups)
-
-    rollup_total = 0
-    rollup_covered = 0
-    rollup_correct = 0
-
-    per_group = {}
-
-    for group, fields in sorted(group_to_fields.items()):
-        if not fields:
-            continue
-
-        rollup_total += 1
-
-        group_all_covered = True
-        group_all_correct = True
-
-        for field in fields:
-            gt_val = gt_flat.get(field)
-            pred_info = pred_flat.get(field)
-            pred_val = pred_info.get("value") if pred_info is not None else None
-
-            status = classify_prediction_status(pred_info, threshold)
-
-            if not is_covered_status(status):
-                group_all_covered = False
-                group_all_correct = False
-                continue
-
-            if pred_val != gt_val:
-                group_all_correct = False
-
-        if group_all_covered:
-            rollup_covered += 1
-            if group_all_correct:
-                rollup_correct += 1
-
-        per_group[group] = {
-            "fields": fields,
-            "covered": group_all_covered,
-            "correct": group_all_correct,
-            "num_fields": len(fields),
-        }
-
-    rollup_coverage_rate = rollup_covered / rollup_total if rollup_total else None
-    rollup_accuracy = rollup_correct / rollup_covered if rollup_covered else None
+    coverage = covered / total if total else None
+    accuracy = correct / covered if covered else None
 
     return {
-        "child_total": child_total,
-        "child_covered": child_covered,
-        "child_correct": child_correct,
-        "child_coverage_rate": child_coverage_rate,
-        "child_accuracy": child_accuracy,
-        "child_f1_balanced_score": fbeta_score(child_accuracy, child_coverage_rate, beta=1.0),
-        "child_f2_coverage_weighted_score": fbeta_score(child_accuracy, child_coverage_rate, beta=2.0),
+        "total": total,
+        "covered": covered,
+        "correct": correct,
+        "coverage": coverage,
+        "accuracy": accuracy,
+        "f1_balanced_score": fbeta_score(accuracy, coverage, beta=1.0),
+        "f2_coverage_weighted_score": fbeta_score(accuracy, coverage, beta=2.0),
 
         "missing_pred": missing_pred,
         "explicit_low_conf": explicit_low_conf,
@@ -525,21 +431,12 @@ def evaluate_one_file(
         "null_pred_correct": null_pred_correct,
         "prediction_only_fields": prediction_only_fields,
 
-        "rollup_total": rollup_total,
-        "rollup_covered": rollup_covered,
-        "rollup_correct": rollup_correct,
-        "rollup_coverage_rate": rollup_coverage_rate,
-        "rollup_accuracy": rollup_accuracy,
-        "rollup_f1_balanced_score": fbeta_score(rollup_accuracy, rollup_coverage_rate, beta=1.0),
-        "rollup_f2_coverage_weighted_score": fbeta_score(rollup_accuracy, rollup_coverage_rate, beta=2.0),
-
         "per_field": per_field,
-        "per_group": per_group,
     }
 
 
 # =========================================================
-# BUILD PER-FILE TABLE FOR ONE DOC TYPE
+# BUILD PER-FILE TABLE FOR ONE DOC TYPE + THRESHOLD
 # =========================================================
 
 def build_folder_per_file_table(
@@ -547,14 +444,12 @@ def build_folder_per_file_table(
     result_folder: Path,
     gt_folder: Path,
     route: str,
-    configured_groups: Optional[List[str]],
     threshold: float,
 ) -> pd.DataFrame:
     result_files = set(list_relative_jsons(result_folder))
     gt_files = set(list_relative_jsons(gt_folder))
 
-    # Start from result files and evaluate only if matching GT exists.
-    # GT files absent from the result are not added as rows here.
+    # Start from result files and evaluate only those with matching GT.
     common_files = sorted([p for p in result_files if p in gt_files])
 
     rows = []
@@ -566,6 +461,7 @@ def build_folder_per_file_table(
         row = {
             "doc_type": folder_name,
             "file": str(rel_path),
+            "threshold": threshold,
             "status": "OK",
         }
 
@@ -596,18 +492,17 @@ def build_folder_per_file_table(
         eval_result = evaluate_one_file(
             gt_flat=gt_flat,
             pred_flat=pred_flat,
-            configured_groups=configured_groups,
             threshold=threshold,
         )
 
         metric_keys = [
-            "child_total",
-            "child_covered",
-            "child_correct",
-            "child_coverage_rate",
-            "child_accuracy",
-            "child_f1_balanced_score",
-            "child_f2_coverage_weighted_score",
+            "total",
+            "covered",
+            "correct",
+            "coverage",
+            "accuracy",
+            "f1_balanced_score",
+            "f2_coverage_weighted_score",
 
             "missing_pred",
             "explicit_low_conf",
@@ -618,20 +513,12 @@ def build_folder_per_file_table(
             "null_pred_covered",
             "null_pred_correct",
             "prediction_only_fields",
-
-            "rollup_total",
-            "rollup_covered",
-            "rollup_correct",
-            "rollup_coverage_rate",
-            "rollup_accuracy",
-            "rollup_f1_balanced_score",
-            "rollup_f2_coverage_weighted_score",
         ]
 
         for k in metric_keys:
             row[k] = eval_result[k]
 
-        # Add detailed field-level columns
+        # Detailed leaf-node columns
         for field, info in eval_result["per_field"].items():
             row[f"{field}_gt_present"] = info["gt_present"]
             row[f"{field}_pred_present"] = info["pred_present"]
@@ -644,11 +531,12 @@ def build_folder_per_file_table(
 
         rows.append(row)
 
-    # Diagnostics only: result files without GT are ignored
+    # Diagnostic rows only
     for rel_path in sorted(result_files - gt_files):
         rows.append({
             "doc_type": folder_name,
             "file": str(rel_path),
+            "threshold": threshold,
             "status": "result_file_without_matching_gt_ignored",
         })
 
@@ -660,15 +548,16 @@ def build_folder_per_file_table(
     fixed_first = [
         "doc_type",
         "file",
+        "threshold",
         "status",
 
-        "child_total",
-        "child_covered",
-        "child_correct",
-        "child_coverage_rate",
-        "child_accuracy",
-        "child_f1_balanced_score",
-        "child_f2_coverage_weighted_score",
+        "total",
+        "covered",
+        "correct",
+        "coverage",
+        "accuracy",
+        "f1_balanced_score",
+        "f2_coverage_weighted_score",
 
         "missing_pred",
         "explicit_low_conf",
@@ -679,14 +568,6 @@ def build_folder_per_file_table(
         "null_pred_covered",
         "null_pred_correct",
         "prediction_only_fields",
-
-        "rollup_total",
-        "rollup_covered",
-        "rollup_correct",
-        "rollup_coverage_rate",
-        "rollup_accuracy",
-        "rollup_f1_balanced_score",
-        "rollup_f2_coverage_weighted_score",
     ]
 
     fixed_first = [c for c in fixed_first if c in df.columns]
@@ -699,21 +580,30 @@ def build_folder_per_file_table(
 # SUMMARY TABLES
 # =========================================================
 
-def build_summary_from_file_table(df: pd.DataFrame, doc_type: str) -> Dict[str, Any]:
+def build_summary_from_file_table(
+    df: pd.DataFrame,
+    doc_type: str,
+    threshold: float,
+    manual_correct_offset_by_folder: Optional[Dict[str, int]] = None,
+) -> Dict[str, Any]:
+
     ok_df = df[df["status"] == "OK"].copy() if "status" in df.columns else pd.DataFrame()
 
     if ok_df.empty:
         return {
             "doc_type": doc_type,
+            "threshold": threshold,
             "files_compared": 0,
 
-            "child_total": 0,
-            "child_covered": 0,
-            "child_correct": 0,
-            "child_coverage_rate": None,
-            "child_accuracy": None,
-            "child_f1_balanced_score": None,
-            "child_f2_coverage_weighted_score": None,
+            "total": 0,
+            "covered": 0,
+            "correct_raw": 0,
+            "correct_manual_offset": 0,
+            "correct": 0,
+            "coverage": None,
+            "accuracy": None,
+            "f1_balanced_score": None,
+            "f2_coverage_weighted_score": None,
 
             "missing_pred": 0,
             "explicit_low_conf": 0,
@@ -724,41 +614,35 @@ def build_summary_from_file_table(df: pd.DataFrame, doc_type: str) -> Dict[str, 
             "null_pred_covered": 0,
             "null_pred_correct": 0,
             "prediction_only_fields": 0,
-
-            "rollup_total": 0,
-            "rollup_covered": 0,
-            "rollup_correct": 0,
-            "rollup_coverage_rate": None,
-            "rollup_accuracy": None,
-            "rollup_f1_balanced_score": None,
-            "rollup_f2_coverage_weighted_score": None,
         }
 
-    child_total = int(ok_df["child_total"].sum())
-    child_covered = int(ok_df["child_covered"].sum())
-    child_correct = int(ok_df["child_correct"].sum())
+    total = int(ok_df["total"].sum())
+    covered = int(ok_df["covered"].sum())
+    correct_raw = int(ok_df["correct"].sum())
 
-    rollup_total = int(ok_df["rollup_total"].sum())
-    rollup_covered = int(ok_df["rollup_covered"].sum())
-    rollup_correct = int(ok_df["rollup_correct"].sum())
+    manual_offset = 0
+    if manual_correct_offset_by_folder is not None:
+        manual_offset = int(manual_correct_offset_by_folder.get(doc_type, 0))
 
-    child_coverage = child_covered / child_total if child_total else None
-    child_accuracy = child_correct / child_covered if child_covered else None
+    correct = min(correct_raw + manual_offset, covered)
 
-    rollup_coverage = rollup_covered / rollup_total if rollup_total else None
-    rollup_accuracy = rollup_correct / rollup_covered if rollup_covered else None
+    coverage = covered / total if total else None
+    accuracy = correct / covered if covered else None
 
     return {
         "doc_type": doc_type,
+        "threshold": threshold,
         "files_compared": int(len(ok_df)),
 
-        "child_total": child_total,
-        "child_covered": child_covered,
-        "child_correct": child_correct,
-        "child_coverage_rate": child_coverage,
-        "child_accuracy": child_accuracy,
-        "child_f1_balanced_score": fbeta_score(child_accuracy, child_coverage, beta=1.0),
-        "child_f2_coverage_weighted_score": fbeta_score(child_accuracy, child_coverage, beta=2.0),
+        "total": total,
+        "covered": covered,
+        "correct_raw": correct_raw,
+        "correct_manual_offset": manual_offset,
+        "correct": correct,
+        "coverage": coverage,
+        "accuracy": accuracy,
+        "f1_balanced_score": fbeta_score(accuracy, coverage, beta=1.0),
+        "f2_coverage_weighted_score": fbeta_score(accuracy, coverage, beta=2.0),
 
         "missing_pred": int(ok_df["missing_pred"].sum()),
         "explicit_low_conf": int(ok_df["explicit_low_conf"].sum()),
@@ -769,18 +653,14 @@ def build_summary_from_file_table(df: pd.DataFrame, doc_type: str) -> Dict[str, 
         "null_pred_covered": int(ok_df["null_pred_covered"].sum()),
         "null_pred_correct": int(ok_df["null_pred_correct"].sum()),
         "prediction_only_fields": int(ok_df["prediction_only_fields"].sum()),
-
-        "rollup_total": rollup_total,
-        "rollup_covered": rollup_covered,
-        "rollup_correct": rollup_correct,
-        "rollup_coverage_rate": rollup_coverage,
-        "rollup_accuracy": rollup_accuracy,
-        "rollup_f1_balanced_score": fbeta_score(rollup_accuracy, rollup_coverage, beta=1.0),
-        "rollup_f2_coverage_weighted_score": fbeta_score(rollup_accuracy, rollup_coverage, beta=2.0),
     }
 
 
-def build_per_field_summary(file_df: pd.DataFrame, doc_type: str) -> pd.DataFrame:
+def build_per_field_summary(
+    file_df: pd.DataFrame,
+    doc_type: str,
+    threshold: float,
+) -> pd.DataFrame:
     if file_df.empty or "status" not in file_df.columns:
         return pd.DataFrame()
 
@@ -806,7 +686,6 @@ def build_per_field_summary(file_df: pd.DataFrame, doc_type: str) -> pd.DataFram
         if covered_col not in ok_df.columns:
             continue
 
-        # A row contributes to this field if field appears in GT or prediction.
         present_mask = pd.Series(False, index=ok_df.index)
 
         if gt_present_col in ok_df.columns:
@@ -845,11 +724,12 @@ def build_per_field_summary(file_df: pd.DataFrame, doc_type: str) -> pd.DataFram
 
         rows.append({
             "doc_type": doc_type,
+            "threshold": threshold,
             "field": field,
             "total": total,
             "covered": covered,
             "correct": correct,
-            "coverage_rate": coverage,
+            "coverage": coverage,
             "accuracy": accuracy,
             "f1_balanced_score": fbeta_score(accuracy, coverage, beta=1.0),
             "f2_coverage_weighted_score": fbeta_score(accuracy, coverage, beta=2.0),
@@ -865,112 +745,133 @@ def build_per_field_summary(file_df: pd.DataFrame, doc_type: str) -> pd.DataFram
 
     if not out.empty:
         out = out.sort_values(
-            ["f1_balanced_score", "coverage_rate", "accuracy"],
-            ascending=[True, True, True],
+            ["threshold", "f1_balanced_score", "coverage", "accuracy"],
+            ascending=[True, True, True, True],
             na_position="last",
         ).reset_index(drop=True)
 
     return out
 
 
+def build_overall_summary(summary_df: pd.DataFrame) -> pd.DataFrame:
+    overall_rows = []
+
+    for threshold, g in summary_df.groupby("threshold", dropna=False):
+        total = int(g["total"].sum())
+        covered = int(g["covered"].sum())
+        correct_raw = int(g["correct_raw"].sum())
+        correct_manual_offset = int(g["correct_manual_offset"].sum())
+        correct = int(g["correct"].sum())
+
+        coverage = covered / total if total else None
+        accuracy = correct / covered if covered else None
+
+        overall_rows.append({
+            "doc_type": "OVERALL",
+            "threshold": threshold,
+            "files_compared": int(g["files_compared"].sum()),
+
+            "total": total,
+            "covered": covered,
+            "correct_raw": correct_raw,
+            "correct_manual_offset": correct_manual_offset,
+            "correct": correct,
+            "coverage": coverage,
+            "accuracy": accuracy,
+            "f1_balanced_score": fbeta_score(accuracy, coverage, beta=1.0),
+            "f2_coverage_weighted_score": fbeta_score(accuracy, coverage, beta=2.0),
+
+            "missing_pred": int(g["missing_pred"].sum()),
+            "explicit_low_conf": int(g["explicit_low_conf"].sum()),
+            "covered_with_confidence": int(g["covered_with_confidence"].sum()),
+            "covered_without_confidence": int(g["covered_without_confidence"].sum()),
+
+            "null_gt_fields": int(g["null_gt_fields"].sum()),
+            "null_pred_covered": int(g["null_pred_covered"].sum()),
+            "null_pred_correct": int(g["null_pred_correct"].sum()),
+            "prediction_only_fields": int(g["prediction_only_fields"].sum()),
+        })
+
+    return pd.DataFrame(overall_rows)
+
+
 # =========================================================
 # MAIN PERFORMANCE RUN
 # =========================================================
 
-def run_performance_evaluation() -> None:
+def run_performance_evaluation_with_thresholds() -> None:
     all_summary_rows = []
     all_field_summaries = []
+    all_file_tables = []
 
-    for doc_type, route in ROUTES_BY_FOLDER.items():
-        result_folder = RESULTS_ROOT / doc_type
-        gt_folder = GROUND_TRUTH_ROOT / doc_type
-        configured_groups = ROLLUP_GROUPS_BY_FOLDER.get(doc_type)
+    for threshold in CONFIDENCE_THRESHOLDS:
+        print(f"\n=== Threshold: {threshold} ===")
 
-        file_df = build_folder_per_file_table(
-            folder_name=doc_type,
-            result_folder=result_folder,
-            gt_folder=gt_folder,
-            route=route,
-            configured_groups=configured_groups,
-            threshold=CONFIDENCE_THRESHOLD,
-        )
+        for doc_type, route in ROUTES_BY_FOLDER.items():
+            result_folder = RESULTS_ROOT / doc_type
+            gt_folder = GROUND_TRUTH_ROOT / doc_type
 
-        file_out = OUTPUT_DIR / f"performance_{doc_type}_per_file.csv"
-        file_df.to_csv(file_out, index=False)
-        print(f"Saved {file_out}")
+            file_df = build_folder_per_file_table(
+                folder_name=doc_type,
+                result_folder=result_folder,
+                gt_folder=gt_folder,
+                route=route,
+                threshold=threshold,
+            )
 
-        summary_row = build_summary_from_file_table(file_df, doc_type)
-        all_summary_rows.append(summary_row)
+            all_file_tables.append(file_df)
 
-        field_summary = build_per_field_summary(file_df, doc_type)
+            file_out = OUTPUT_DIR / f"performance_{doc_type}_threshold_{threshold}_per_file.csv"
+            file_df.to_csv(file_out, index=False)
+            print(f"Saved {file_out}")
 
-        if not field_summary.empty:
-            all_field_summaries.append(field_summary)
-            field_out = OUTPUT_DIR / f"performance_{doc_type}_per_field.csv"
-            field_summary.to_csv(field_out, index=False)
-            print(f"Saved {field_out}")
+            summary_row = build_summary_from_file_table(
+                df=file_df,
+                doc_type=doc_type,
+                threshold=threshold,
+                manual_correct_offset_by_folder=MANUAL_CORRECT_OFFSET_BY_FOLDER,
+            )
+            all_summary_rows.append(summary_row)
 
+            field_summary = build_per_field_summary(
+                file_df=file_df,
+                doc_type=doc_type,
+                threshold=threshold,
+            )
+
+            if not field_summary.empty:
+                all_field_summaries.append(field_summary)
+
+                field_out = OUTPUT_DIR / f"performance_{doc_type}_threshold_{threshold}_per_field.csv"
+                field_summary.to_csv(field_out, index=False)
+                print(f"Saved {field_out}")
+
+    # Doc-type summary across all thresholds
     summary_df = pd.DataFrame(all_summary_rows)
 
-    # Overall micro-average across doc types
-    child_total = int(summary_df["child_total"].sum())
-    child_covered = int(summary_df["child_covered"].sum())
-    child_correct = int(summary_df["child_correct"].sum())
+    # Overall rows per threshold
+    overall_df = build_overall_summary(summary_df)
 
-    rollup_total = int(summary_df["rollup_total"].sum())
-    rollup_covered = int(summary_df["rollup_covered"].sum())
-    rollup_correct = int(summary_df["rollup_correct"].sum())
+    final_summary_df = pd.concat([summary_df, overall_df], ignore_index=True)
 
-    child_coverage = child_covered / child_total if child_total else None
-    child_accuracy = child_correct / child_covered if child_covered else None
+    summary_out = OUTPUT_DIR / "performance_summary_all_thresholds.csv"
+    final_summary_df.to_csv(summary_out, index=False)
+    print(f"\nSaved {summary_out}")
 
-    rollup_coverage = rollup_covered / rollup_total if rollup_total else None
-    rollup_accuracy = rollup_correct / rollup_covered if rollup_covered else None
-
-    overall_row = {
-        "doc_type": "OVERALL",
-        "files_compared": int(summary_df["files_compared"].sum()),
-
-        "child_total": child_total,
-        "child_covered": child_covered,
-        "child_correct": child_correct,
-        "child_coverage_rate": child_coverage,
-        "child_accuracy": child_accuracy,
-        "child_f1_balanced_score": fbeta_score(child_accuracy, child_coverage, beta=1.0),
-        "child_f2_coverage_weighted_score": fbeta_score(child_accuracy, child_coverage, beta=2.0),
-
-        "missing_pred": int(summary_df["missing_pred"].sum()),
-        "explicit_low_conf": int(summary_df["explicit_low_conf"].sum()),
-        "covered_with_confidence": int(summary_df["covered_with_confidence"].sum()),
-        "covered_without_confidence": int(summary_df["covered_without_confidence"].sum()),
-
-        "null_gt_fields": int(summary_df["null_gt_fields"].sum()),
-        "null_pred_covered": int(summary_df["null_pred_covered"].sum()),
-        "null_pred_correct": int(summary_df["null_pred_correct"].sum()),
-        "prediction_only_fields": int(summary_df["prediction_only_fields"].sum()),
-
-        "rollup_total": rollup_total,
-        "rollup_covered": rollup_covered,
-        "rollup_correct": rollup_correct,
-        "rollup_coverage_rate": rollup_coverage,
-        "rollup_accuracy": rollup_accuracy,
-        "rollup_f1_balanced_score": fbeta_score(rollup_accuracy, rollup_coverage, beta=1.0),
-        "rollup_f2_coverage_weighted_score": fbeta_score(rollup_accuracy, rollup_coverage, beta=2.0),
-    }
-
-    summary_df = pd.concat([summary_df, pd.DataFrame([overall_row])], ignore_index=True)
-
-    summary_out = OUTPUT_DIR / "performance_summary.csv"
-    summary_df.to_csv(summary_out, index=False)
-    print(f"Saved {summary_out}")
-
+    # Combined field summary
     if all_field_summaries:
         all_field_df = pd.concat(all_field_summaries, ignore_index=True)
-
-        all_field_out = OUTPUT_DIR / "performance_all_fields.csv"
+        all_field_out = OUTPUT_DIR / "performance_all_fields_all_thresholds.csv"
         all_field_df.to_csv(all_field_out, index=False)
         print(f"Saved {all_field_out}")
 
+    # Combined per-file table
+    if all_file_tables:
+        all_file_df = pd.concat(all_file_tables, ignore_index=True)
+        all_file_out = OUTPUT_DIR / "performance_all_files_all_thresholds.csv"
+        all_file_df.to_csv(all_file_out, index=False)
+        print(f"Saved {all_file_out}")
+
 
 if __name__ == "__main__":
-    run_performance_evaluation()
+    run_performance_evaluation_with_thresholds()
