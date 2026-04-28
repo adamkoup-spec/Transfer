@@ -2,8 +2,6 @@ import json
 import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from collections import defaultdict
-
 import pandas as pd
 import matplotlib.pyplot as plt
 
@@ -12,28 +10,48 @@ import matplotlib.pyplot as plt
 # CONFIG
 # =========================================================
 
-GROUND_TRUTH_ROOT = Path("/path/to/ground_truth")
+STRESS_ROOT = Path(r"C:\path\to\stress_results")
+GROUND_TRUTH_ROOT = Path(r"C:\path\to\ground_truth")
+
+# Example folder structure:
+# STRESS_ROOT/
+#   baseline/
+#     A/
+#     B/
+#     C/
+#   light_noise/
+#     A/
+#     B/
+#     C/
+#   medium_noise/
+#     A/
+#     B/
+#     C/
+#   heavy_noise/
+#     A/
+#     B/
+#     C/
 
 RESULT_ROOTS = {
-    "Baseline": Path("/path/to/baseline_results"),
-    "Stress Test 1": Path("/path/to/stress_test_1_results"),
-    "Stress Test 2": Path("/path/to/stress_test_2_results"),
-    "Stress Test 3": Path("/path/to/stress_test_3_results"),
+    "Baseline": STRESS_ROOT / "baseline",
+    "Light Noise": STRESS_ROOT / "light_noise",
+    "Medium Noise": STRESS_ROOT / "medium_noise",
+    "Heavy Noise": STRESS_ROOT / "heavy_noise",
 }
 
-# Routes by doc type / folder name
+RESULT_ORDER = [
+    "Baseline",
+    "Light Noise",
+    "Medium Noise",
+    "Heavy Noise",
+]
+
+BASELINE_NAME = "Baseline"
+
 ROUTES_BY_FOLDER = {
     "A": "response.output",
     "B": "prediction.final",
     "C": "data.items",
-}
-
-# Optional custom rollup groups.
-# None means top-level grouping.
-ROLLUP_GROUPS_BY_FOLDER = {
-    "A": None,
-    "B": None,
-    "C": None,
 }
 
 CONFIDENCE_THRESHOLD = 80
@@ -42,8 +60,19 @@ CONFIDENCE_IS_PROBABILITY = False
 STRIP_STRINGS = True
 CASE_INSENSITIVE_STRINGS = False
 
-OUTPUT_DIR = Path("./stress_test_plots")
+# Manual corrections to naive exact-match correct count.
+# Applied at stress condition + doc_type summary level.
+MANUAL_CORRECT_OFFSET_BY_RESULT_AND_FOLDER = {
+    "Baseline": {"A": 0, "B": 0, "C": 0},
+    "Light Noise": {"A": 0, "B": 0, "C": 0},
+    "Medium Noise": {"A": 0, "B": 0, "C": 0},
+    "Heavy Noise": {"A": 0, "B": 0, "C": 0},
+}
+
+OUTPUT_DIR = Path("./stress_test_output")
+PLOT_DIR = OUTPUT_DIR / "plots"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+PLOT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # =========================================================
@@ -66,11 +95,16 @@ def normalize_value(x: Any) -> Any:
 
 def get_by_route(obj: Any, route: str) -> Any:
     cur = obj
+
+    if route is None or route == "":
+        return cur
+
     for part in route.split("."):
         if isinstance(cur, dict):
             if part not in cur:
                 return None
             cur = cur[part]
+
         elif isinstance(cur, list):
             if not part.isdigit():
                 return None
@@ -78,8 +112,10 @@ def get_by_route(obj: Any, route: str) -> Any:
             if idx < 0 or idx >= len(cur):
                 return None
             cur = cur[idx]
+
         else:
             return None
+
     return cur
 
 
@@ -92,6 +128,7 @@ def list_relative_jsons(folder: Path) -> List[Path]:
 def coerce_confidence(x: Any) -> Optional[float]:
     if x is None:
         return None
+
     try:
         val = float(x)
     except Exception:
@@ -106,14 +143,81 @@ def coerce_confidence(x: Any) -> Optional[float]:
     return val
 
 
+def find_all_confidences(obj: Any) -> List[float]:
+    confidences = []
+
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == "confidence":
+                c = coerce_confidence(v)
+                if c is not None:
+                    confidences.append(c)
+            else:
+                confidences.extend(find_all_confidences(v))
+
+    elif isinstance(obj, list):
+        for item in obj:
+            confidences.extend(find_all_confidences(item))
+
+    return confidences
+
+
+def extract_node_confidence(obj: Any) -> Optional[float]:
+    confidences = find_all_confidences(obj)
+    if not confidences:
+        return None
+    return max(confidences)
+
+
+def fbeta_score(
+    accuracy: Optional[float],
+    coverage: Optional[float],
+    beta: float = 1.0,
+) -> Optional[float]:
+    if accuracy is None or coverage is None:
+        return None
+
+    if accuracy == 0 and coverage == 0:
+        return 0.0
+
+    beta2 = beta ** 2
+    denom = beta2 * accuracy + coverage
+
+    if denom == 0:
+        return 0.0
+
+    return (1 + beta2) * accuracy * coverage / denom
+
+
+def get_manual_correct_offset(result_name: str, doc_type: str) -> int:
+    return int(
+        MANUAL_CORRECT_OFFSET_BY_RESULT_AND_FOLDER
+        .get(result_name, {})
+        .get(doc_type, 0)
+    )
+
+
 # =========================================================
 # FLATTENING
 # =========================================================
 
-def flatten_prediction_value_paths(obj: Any, parent_key: str = "") -> Dict[str, Dict[str, Any]]:
+def flatten_prediction_value_paths(
+    obj: Any,
+    parent_key: str = "",
+) -> Dict[str, Dict[str, Any]]:
     """
-    Finds all leaf nodes with key 'value'.
-    For predictions, also extracts confidence from sibling 'co-ords.confidence'.
+    Recursively finds every dict containing key 'value'.
+
+    Prediction output:
+    {
+        "address.city": {
+            "value": "Dallas",
+            "confidence": 91.0,
+            "has_confidence": True
+        }
+    }
+
+    Null is a real prediction value if the prediction node exists.
     """
     items = {}
 
@@ -121,28 +225,22 @@ def flatten_prediction_value_paths(obj: Any, parent_key: str = "") -> Dict[str, 
         if "value" in obj:
             clean_key = parent_key if parent_key else "value"
             raw_value = obj.get("value")
-            coords = obj.get("co-ords")
-
-            confidence = None
-            if isinstance(coords, dict):
-                confidence = coerce_confidence(coords.get("confidence"))
+            confidence = extract_node_confidence(obj)
 
             items[clean_key] = {
                 "value": normalize_value(raw_value),
                 "confidence": confidence,
-                "has_value": raw_value is not None,
                 "has_confidence": confidence is not None,
             }
 
         for k, v in obj.items():
             if k == "value":
                 continue
+
             new_key = f"{parent_key}.{k}" if parent_key else k
             items.update(flatten_prediction_value_paths(v, new_key))
 
     elif isinstance(obj, list):
-        # If lists are unordered, this still compares by index.
-        # For unordered lists, add list alignment before flattening.
         for i, v in enumerate(obj):
             new_key = f"{parent_key}.{i}" if parent_key else str(i)
             items.update(flatten_prediction_value_paths(v, new_key))
@@ -150,9 +248,12 @@ def flatten_prediction_value_paths(obj: Any, parent_key: str = "") -> Dict[str, 
     return items
 
 
-def flatten_gt_value_paths(obj: Any, parent_key: str = "") -> Dict[str, Any]:
+def flatten_gt_value_paths(
+    obj: Any,
+    parent_key: str = "",
+) -> Dict[str, Any]:
     """
-    Finds all leaf nodes with key 'value' in GT.
+    Recursively finds every dict containing key 'value' on GT side.
     """
     items = {}
 
@@ -164,6 +265,7 @@ def flatten_gt_value_paths(obj: Any, parent_key: str = "") -> Dict[str, Any]:
         for k, v in obj.items():
             if k == "value":
                 continue
+
             new_key = f"{parent_key}.{k}" if parent_key else k
             items.update(flatten_gt_value_paths(v, new_key))
 
@@ -176,228 +278,371 @@ def flatten_gt_value_paths(obj: Any, parent_key: str = "") -> Dict[str, Any]:
 
 
 # =========================================================
-# EVALUATION
+# STATUS / COVERAGE LOGIC
 # =========================================================
 
-def classify_prediction_status(pred_info: Optional[Dict[str, Any]], threshold: float) -> str:
+def classify_prediction_status(
+    pred_info: Optional[Dict[str, Any]],
+    threshold: float,
+) -> str:
+    """
+    Latest rule:
+
+    missing_pred:
+        prediction key/node does not exist
+        => not covered
+
+    explicit_low_conf:
+        prediction exists, confidence exists, confidence < threshold
+        => not covered
+
+    covered_with_confidence:
+        prediction exists, confidence exists, confidence >= threshold
+        => covered
+
+    covered_without_confidence:
+        prediction exists, confidence missing/null
+        => covered
+
+    This applies whether prediction value is null or non-null.
+    """
     if pred_info is None:
         return "missing_pred"
 
-    if not pred_info.get("has_value", False):
-        return "null_or_ignored"
-
     confidence = pred_info.get("confidence")
 
-    if confidence is None:
-        return "missing_confidence"
+    if confidence is not None and confidence < threshold:
+        return "explicit_low_conf"
 
-    if confidence < threshold:
-        return "low_conf"
+    if confidence is not None and confidence >= threshold:
+        return "covered_with_confidence"
 
-    return "evaluated"
-
-
-def infer_default_group(field_name: str) -> str:
-    return field_name.split(".")[0]
+    return "covered_without_confidence"
 
 
-def assign_group_for_field(field_name: str, configured_groups: Optional[List[str]]) -> str:
-    if configured_groups:
-        matches = [
-            g for g in configured_groups
-            if field_name == g or field_name.startswith(g + ".")
-        ]
-        if matches:
-            return max(matches, key=len)
-
-    return infer_default_group(field_name)
+def is_covered_status(status: str) -> bool:
+    return status in {
+        "covered_with_confidence",
+        "covered_without_confidence",
+    }
 
 
-def build_group_to_fields(
-    field_names: List[str],
-    configured_groups: Optional[List[str]],
-) -> Dict[str, List[str]]:
-    out = defaultdict(list)
-    for field in field_names:
-        group = assign_group_for_field(field, configured_groups)
-        out[group].append(field)
-    return dict(out)
+# =========================================================
+# EVALUATE ONE FILE
+# =========================================================
+
+def evaluate_one_file(
+    gt_flat: Dict[str, Any],
+    pred_flat: Dict[str, Dict[str, Any]],
+    threshold: float,
+) -> Dict[str, Any]:
+    """
+    Leaf-level only.
+
+    total:
+        all leaf fields appearing in GT or prediction.
+
+    covered:
+        prediction exists and is not explicitly low-confidence.
+
+    correct:
+        covered prediction value equals GT value.
+        Null is compared as a real value.
+    """
+    all_fields = sorted(set(gt_flat.keys()) | set(pred_flat.keys()))
+
+    total = len(all_fields)
+    covered = 0
+    correct = 0
+
+    missing_pred = 0
+    explicit_low_conf = 0
+    covered_with_confidence = 0
+    covered_without_confidence = 0
+
+    null_gt_fields = 0
+    null_pred_covered = 0
+    null_pred_correct = 0
+    prediction_only_fields = 0
+
+    for field in all_fields:
+        gt_present = field in gt_flat
+        pred_present = field in pred_flat
+
+        gt_val = gt_flat.get(field)
+        pred_info = pred_flat.get(field)
+        pred_val = pred_info.get("value") if pred_info is not None else None
+
+        if gt_present and gt_val is None:
+            null_gt_fields += 1
+
+        if pred_present and not gt_present:
+            prediction_only_fields += 1
+
+        status = classify_prediction_status(pred_info, threshold)
+
+        if is_covered_status(status):
+            covered += 1
+
+            if pred_val == gt_val:
+                correct += 1
+
+            if pred_val is None:
+                null_pred_covered += 1
+                if pred_val == gt_val:
+                    null_pred_correct += 1
+
+            if status == "covered_with_confidence":
+                covered_with_confidence += 1
+            elif status == "covered_without_confidence":
+                covered_without_confidence += 1
+
+        else:
+            if status == "missing_pred":
+                missing_pred += 1
+            elif status == "explicit_low_conf":
+                explicit_low_conf += 1
+
+    coverage = covered / total if total else None
+    accuracy = correct / covered if covered else None
+
+    return {
+        "total": total,
+        "covered": covered,
+        "correct": correct,
+        "coverage": coverage,
+        "accuracy": accuracy,
+        "f1_balanced_score": fbeta_score(accuracy, coverage, beta=1.0),
+        "f2_coverage_weighted_score": fbeta_score(accuracy, coverage, beta=2.0),
+
+        "missing_pred": missing_pred,
+        "explicit_low_conf": explicit_low_conf,
+        "covered_with_confidence": covered_with_confidence,
+        "covered_without_confidence": covered_without_confidence,
+
+        "null_gt_fields": null_gt_fields,
+        "null_pred_covered": null_pred_covered,
+        "null_pred_correct": null_pred_correct,
+        "prediction_only_fields": prediction_only_fields,
+    }
 
 
-def evaluate_result_root(
+# =========================================================
+# EVALUATE STRESS CONDITION + DOC TYPE
+# =========================================================
+
+def evaluate_result_doc_type(
+    result_name: str,
     result_root: Path,
     gt_root: Path,
-    result_name: str,
-    routes_by_folder: Dict[str, str],
-    rollup_groups_by_folder: Dict[str, Optional[List[str]]],
+    doc_type: str,
+    route: str,
     threshold: float,
-) -> pd.DataFrame:
-    """
-    Returns one row per result_name + doc_type.
-    """
+) -> Dict[str, Any]:
+    result_folder = result_root / doc_type
+    gt_folder = gt_root / doc_type
+
+    result_files = set(list_relative_jsons(result_folder))
+    gt_files = set(list_relative_jsons(gt_folder))
+
+    # Start from result files only; ignore result files with no matching GT.
+    common_files = sorted([p for p in result_files if p in gt_files])
+
+    total = 0
+    covered = 0
+    correct_raw = 0
+
+    missing_pred = 0
+    explicit_low_conf = 0
+    covered_with_confidence = 0
+    covered_without_confidence = 0
+
+    null_gt_fields = 0
+    null_pred_covered = 0
+    null_pred_correct = 0
+    prediction_only_fields = 0
+
+    files_compared = 0
+    route_failures = 0
+    unreadable_files = 0
+
+    result_file_without_matching_gt_ignored = len(result_files - gt_files)
+    gt_file_without_matching_result_ignored = len(gt_files - result_files)
+
+    for rel_path in common_files:
+        pred_path = result_folder / rel_path
+        gt_path = gt_folder / rel_path
+
+        try:
+            pred_json = load_json(pred_path)
+            gt_json = load_json(gt_path)
+        except Exception:
+            unreadable_files += 1
+            continue
+
+        pred_subtree = get_by_route(pred_json, route)
+        gt_subtree = get_by_route(gt_json, route)
+
+        if pred_subtree is None or gt_subtree is None:
+            route_failures += 1
+            continue
+
+        pred_flat = flatten_prediction_value_paths(pred_subtree)
+        gt_flat = flatten_gt_value_paths(gt_subtree)
+
+        file_eval = evaluate_one_file(
+            gt_flat=gt_flat,
+            pred_flat=pred_flat,
+            threshold=threshold,
+        )
+
+        files_compared += 1
+
+        total += file_eval["total"]
+        covered += file_eval["covered"]
+        correct_raw += file_eval["correct"]
+
+        missing_pred += file_eval["missing_pred"]
+        explicit_low_conf += file_eval["explicit_low_conf"]
+        covered_with_confidence += file_eval["covered_with_confidence"]
+        covered_without_confidence += file_eval["covered_without_confidence"]
+
+        null_gt_fields += file_eval["null_gt_fields"]
+        null_pred_covered += file_eval["null_pred_covered"]
+        null_pred_correct += file_eval["null_pred_correct"]
+        prediction_only_fields += file_eval["prediction_only_fields"]
+
+    manual_offset = get_manual_correct_offset(result_name, doc_type)
+    correct = min(correct_raw + manual_offset, covered)
+
+    coverage = covered / total if total else None
+    accuracy = correct / covered if covered else None
+
+    return {
+        "result_name": result_name,
+        "doc_type": doc_type,
+        "threshold": threshold,
+        "files_compared": files_compared,
+
+        "result_file_without_matching_gt_ignored": result_file_without_matching_gt_ignored,
+        "gt_file_without_matching_result_ignored": gt_file_without_matching_result_ignored,
+        "route_failures": route_failures,
+        "unreadable_files": unreadable_files,
+
+        "total": total,
+        "covered": covered,
+        "correct_raw": correct_raw,
+        "correct_manual_offset": manual_offset,
+        "correct": correct,
+        "coverage": coverage,
+        "accuracy": accuracy,
+        "f1_balanced_score": fbeta_score(accuracy, coverage, beta=1.0),
+        "f2_coverage_weighted_score": fbeta_score(accuracy, coverage, beta=2.0),
+
+        "missing_pred": missing_pred,
+        "explicit_low_conf": explicit_low_conf,
+        "covered_with_confidence": covered_with_confidence,
+        "covered_without_confidence": covered_without_confidence,
+
+        "null_gt_fields": null_gt_fields,
+        "null_pred_covered": null_pred_covered,
+        "null_pred_correct": null_pred_correct,
+        "prediction_only_fields": prediction_only_fields,
+    }
+
+
+# =========================================================
+# BUILD TABLES
+# =========================================================
+
+def evaluate_all_stress_results() -> pd.DataFrame:
     rows = []
 
-    for folder_name, route in routes_by_folder.items():
-        result_folder = result_root / folder_name
-        gt_folder = gt_root / folder_name
+    for result_name, result_root in RESULT_ROOTS.items():
+        print(f"\nResult set: {result_name}")
 
-        result_files = set(list_relative_jsons(result_folder))
-        gt_files = set(list_relative_jsons(gt_folder))
-        common_files = sorted(result_files & gt_files)
+        for doc_type, route in ROUTES_BY_FOLDER.items():
+            row = evaluate_result_doc_type(
+                result_name=result_name,
+                result_root=result_root,
+                gt_root=GROUND_TRUTH_ROOT,
+                doc_type=doc_type,
+                route=route,
+                threshold=CONFIDENCE_THRESHOLD,
+            )
+            rows.append(row)
 
-        child_total = 0
-        child_evaluated = 0
-        child_correct = 0
+    return pd.DataFrame(rows)
 
-        rollup_total = 0
-        rollup_covered = 0
-        rollup_correct = 0
 
-        files_compared = 0
-        missing_in_gt = len(result_files - gt_files)
-        missing_in_prediction = len(gt_files - result_files)
+def build_overall_metrics(by_doc_type_df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
 
-        for rel_path in common_files:
-            pred_path = result_folder / rel_path
-            gt_path = gt_folder / rel_path
+    for result_name, g in by_doc_type_df.groupby("result_name", dropna=False):
+        total = int(g["total"].sum())
+        covered = int(g["covered"].sum())
+        correct_raw = int(g["correct_raw"].sum())
+        correct_manual_offset = int(g["correct_manual_offset"].sum())
+        correct = int(g["correct"].sum())
 
-            try:
-                pred_json = load_json(pred_path)
-                gt_json = load_json(gt_path)
-            except Exception:
-                continue
-
-            pred_subtree = get_by_route(pred_json, route)
-            gt_subtree = get_by_route(gt_json, route)
-
-            if pred_subtree is None or gt_subtree is None:
-                continue
-
-            pred_flat = flatten_prediction_value_paths(pred_subtree)
-            gt_flat = flatten_gt_value_paths(gt_subtree)
-
-            all_fields = sorted(set(gt_flat.keys()) | set(pred_flat.keys()))
-            valid_fields = [f for f in all_fields if gt_flat.get(f) is not None]
-
-            if not valid_fields:
-                continue
-
-            files_compared += 1
-
-            # -----------------------------
-            # Child-level metrics
-            # -----------------------------
-            for field in valid_fields:
-                gt_val = gt_flat.get(field)
-                pred_info = pred_flat.get(field)
-                status = classify_prediction_status(pred_info, threshold)
-
-                child_total += 1
-
-                if status == "evaluated":
-                    child_evaluated += 1
-                    if pred_info["value"] == gt_val:
-                        child_correct += 1
-
-            # -----------------------------
-            # Rollup metrics
-            # -----------------------------
-            configured_groups = rollup_groups_by_folder.get(folder_name)
-            group_to_fields = build_group_to_fields(valid_fields, configured_groups)
-
-            for group, fields in group_to_fields.items():
-                rollup_total += 1
-
-                all_evaluated = True
-                all_correct = True
-
-                for field in fields:
-                    gt_val = gt_flat.get(field)
-                    pred_info = pred_flat.get(field)
-                    status = classify_prediction_status(pred_info, threshold)
-
-                    if status != "evaluated":
-                        all_evaluated = False
-                        all_correct = False
-                    else:
-                        if pred_info["value"] != gt_val:
-                            all_correct = False
-
-                if all_evaluated:
-                    rollup_covered += 1
-                    if all_correct:
-                        rollup_correct += 1
-
-        child_coverage_rate = child_evaluated / child_total if child_total else None
-        child_accuracy = child_correct / child_evaluated if child_evaluated else None
-
-        rollup_coverage_rate = rollup_covered / rollup_total if rollup_total else None
-        rollup_accuracy = rollup_correct / rollup_covered if rollup_covered else None
+        coverage = covered / total if total else None
+        accuracy = correct / covered if covered else None
 
         rows.append({
             "result_name": result_name,
-            "doc_type": folder_name,
-            "files_compared": files_compared,
-            "missing_in_gt": missing_in_gt,
-            "missing_in_prediction": missing_in_prediction,
+            "doc_type": "OVERALL",
+            "threshold": CONFIDENCE_THRESHOLD,
+            "files_compared": int(g["files_compared"].sum()),
 
-            "child_total": child_total,
-            "child_evaluated": child_evaluated,
-            "child_correct": child_correct,
-            "child_coverage_rate": child_coverage_rate,
-            "child_accuracy": child_accuracy,
+            "result_file_without_matching_gt_ignored": int(g["result_file_without_matching_gt_ignored"].sum()),
+            "gt_file_without_matching_result_ignored": int(g["gt_file_without_matching_result_ignored"].sum()),
+            "route_failures": int(g["route_failures"].sum()),
+            "unreadable_files": int(g["unreadable_files"].sum()),
 
-            "rollup_total": rollup_total,
-            "rollup_covered": rollup_covered,
-            "rollup_correct": rollup_correct,
-            "rollup_coverage_rate": rollup_coverage_rate,
-            "rollup_accuracy": rollup_accuracy,
+            "total": total,
+            "covered": covered,
+            "correct_raw": correct_raw,
+            "correct_manual_offset": correct_manual_offset,
+            "correct": correct,
+            "coverage": coverage,
+            "accuracy": accuracy,
+            "f1_balanced_score": fbeta_score(accuracy, coverage, beta=1.0),
+            "f2_coverage_weighted_score": fbeta_score(accuracy, coverage, beta=2.0),
+
+            "missing_pred": int(g["missing_pred"].sum()),
+            "explicit_low_conf": int(g["explicit_low_conf"].sum()),
+            "covered_with_confidence": int(g["covered_with_confidence"].sum()),
+            "covered_without_confidence": int(g["covered_without_confidence"].sum()),
+
+            "null_gt_fields": int(g["null_gt_fields"].sum()),
+            "null_pred_covered": int(g["null_pred_covered"].sum()),
+            "null_pred_correct": int(g["null_pred_correct"].sum()),
+            "prediction_only_fields": int(g["prediction_only_fields"].sum()),
         })
 
     return pd.DataFrame(rows)
 
 
-def evaluate_all_results() -> pd.DataFrame:
-    frames = []
-
-    for result_name, result_root in RESULT_ROOTS.items():
-        df = evaluate_result_root(
-            result_root=result_root,
-            gt_root=GROUND_TRUTH_ROOT,
-            result_name=result_name,
-            routes_by_folder=ROUTES_BY_FOLDER,
-            rollup_groups_by_folder=ROLLUP_GROUPS_BY_FOLDER,
-            threshold=CONFIDENCE_THRESHOLD,
-        )
-        frames.append(df)
-
-    return pd.concat(frames, ignore_index=True)
-
-
-# =========================================================
-# DEGRADATION TABLES
-# =========================================================
-
-def add_degradation_vs_baseline(
+def add_delta_vs_baseline(
     df: pd.DataFrame,
-    baseline_name: str = "Baseline",
+    baseline_name: str = BASELINE_NAME,
 ) -> pd.DataFrame:
     metrics = [
-        "child_coverage_rate",
-        "child_accuracy",
-        "rollup_coverage_rate",
-        "rollup_accuracy",
+        "coverage",
+        "accuracy",
+        "f1_balanced_score",
+        "f2_coverage_weighted_score",
     ]
 
     out = df.copy()
 
-    baseline = (
+    base = (
         out[out["result_name"] == baseline_name]
         [["doc_type"] + metrics]
         .rename(columns={m: f"{m}_baseline" for m in metrics})
     )
 
-    out = out.merge(baseline, on="doc_type", how="left")
+    out = out.merge(base, on="doc_type", how="left")
 
     for m in metrics:
         out[f"{m}_delta_vs_baseline"] = out[m] - out[f"{m}_baseline"]
@@ -408,45 +653,14 @@ def add_degradation_vs_baseline(
     return out
 
 
-def build_overall_metrics(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Micro-averaged overall metrics across doc types.
-    """
-    rows = []
-
-    for result_name, g in df.groupby("result_name"):
-        child_total = g["child_total"].sum()
-        child_evaluated = g["child_evaluated"].sum()
-        child_correct = g["child_correct"].sum()
-
-        rollup_total = g["rollup_total"].sum()
-        rollup_covered = g["rollup_covered"].sum()
-        rollup_correct = g["rollup_correct"].sum()
-
-        rows.append({
-            "result_name": result_name,
-            "doc_type": "OVERALL",
-            "files_compared": g["files_compared"].sum(),
-
-            "child_total": child_total,
-            "child_evaluated": child_evaluated,
-            "child_correct": child_correct,
-            "child_coverage_rate": child_evaluated / child_total if child_total else None,
-            "child_accuracy": child_correct / child_evaluated if child_evaluated else None,
-
-            "rollup_total": rollup_total,
-            "rollup_covered": rollup_covered,
-            "rollup_correct": rollup_correct,
-            "rollup_coverage_rate": rollup_covered / rollup_total if rollup_total else None,
-            "rollup_accuracy": rollup_correct / rollup_covered if rollup_covered else None,
-        })
-
-    return pd.DataFrame(rows)
-
-
 # =========================================================
 # PLOTTING
 # =========================================================
+
+def result_order_present(df: pd.DataFrame) -> List[str]:
+    present = set(df["result_name"])
+    return [x for x in RESULT_ORDER if x in present]
+
 
 def plot_metric_by_doc_type(
     df: pd.DataFrame,
@@ -454,175 +668,369 @@ def plot_metric_by_doc_type(
     title: str,
     output_path: Path,
 ) -> None:
-    pivot = df.pivot(index="doc_type", columns="result_name", values=metric)
+    plot_df = df.copy()
+    plot_df[metric] = pd.to_numeric(plot_df[metric], errors="coerce")
 
-    # Keep columns in configured order
-    desired_cols = [name for name in RESULT_ROOTS.keys() if name in pivot.columns]
-    pivot = pivot[desired_cols]
+    if plot_df[metric].dropna().empty:
+        print(f"SKIP plot: {metric} has no numeric data.")
+        return
+
+    pivot = plot_df.pivot(index="doc_type", columns="result_name", values=metric)
+    cols = [x for x in RESULT_ORDER if x in pivot.columns]
+    pivot = pivot[cols]
+
+    if pivot.dropna(how="all").empty:
+        print(f"SKIP plot: {metric} pivot is empty.")
+        return
 
     ax = pivot.plot(kind="bar", figsize=(12, 6))
     ax.set_title(title)
     ax.set_xlabel("Doc Type")
     ax.set_ylabel(metric.replace("_", " ").title())
     ax.set_ylim(0, 1)
-    ax.legend(title="Run Type", bbox_to_anchor=(1.02, 1), loc="upper left")
+    ax.legend(title="Stress Condition", bbox_to_anchor=(1.02, 1), loc="upper left")
+
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
     plt.close()
 
 
-def plot_degradation_delta(
-    df_deg: pd.DataFrame,
+def plot_delta_by_doc_type(
+    delta_df: pd.DataFrame,
     metric_delta: str,
     title: str,
     output_path: Path,
 ) -> None:
-    plot_df = df_deg[df_deg["result_name"] != "Baseline"].copy()
+    plot_df = delta_df[delta_df["result_name"] != BASELINE_NAME].copy()
+    plot_df[metric_delta] = pd.to_numeric(plot_df[metric_delta], errors="coerce")
+
+    if plot_df[metric_delta].dropna().empty:
+        print(f"SKIP delta plot: {metric_delta} has no numeric data.")
+        return
 
     pivot = plot_df.pivot(index="doc_type", columns="result_name", values=metric_delta)
+    cols = [x for x in RESULT_ORDER if x != BASELINE_NAME and x in pivot.columns]
+    pivot = pivot[cols]
 
-    desired_cols = [name for name in RESULT_ROOTS.keys() if name != "Baseline" and name in pivot.columns]
-    pivot = pivot[desired_cols]
+    if pivot.dropna(how="all").empty:
+        print(f"SKIP delta plot: {metric_delta} pivot is empty.")
+        return
 
     ax = pivot.plot(kind="bar", figsize=(12, 6))
     ax.axhline(0, linewidth=1)
     ax.set_title(title)
     ax.set_xlabel("Doc Type")
     ax.set_ylabel("Delta vs Baseline")
-    ax.legend(title="Stress Test", bbox_to_anchor=(1.02, 1), loc="upper left")
+    ax.legend(title="Stress Condition", bbox_to_anchor=(1.02, 1), loc="upper left")
+
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
     plt.close()
 
 
-def plot_overall_metrics(overall_df: pd.DataFrame, output_path: Path) -> None:
-    metrics = [
-        "child_coverage_rate",
-        "child_accuracy",
-        "rollup_coverage_rate",
-        "rollup_accuracy",
-    ]
+def plot_overall_metric(
+    overall_df: pd.DataFrame,
+    metric: str,
+    title: str,
+    output_path: Path,
+) -> None:
+    plot_df = overall_df.copy()
+    plot_df[metric] = pd.to_numeric(plot_df[metric], errors="coerce")
 
-    plot_df = overall_df.set_index("result_name")[metrics]
-    plot_df = plot_df.loc[[name for name in RESULT_ROOTS.keys() if name in plot_df.index]]
+    if plot_df[metric].dropna().empty:
+        print(f"SKIP overall plot: {metric} has no numeric data.")
+        return
 
-    ax = plot_df.plot(kind="bar", figsize=(12, 6))
-    ax.set_title("Overall Performance Under Stress Tests")
-    ax.set_xlabel("Run Type")
-    ax.set_ylabel("Metric Value")
+    plot_df = plot_df.set_index("result_name")
+    order = [x for x in RESULT_ORDER if x in plot_df.index]
+    plot_df = plot_df.loc[order]
+
+    ax = plot_df[metric].plot(kind="bar", figsize=(10, 5))
+    ax.set_title(title)
+    ax.set_xlabel("Stress Condition")
+    ax.set_ylabel(metric.replace("_", " ").title())
     ax.set_ylim(0, 1)
-    ax.legend(title="Metric", bbox_to_anchor=(1.02, 1), loc="upper left")
+
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
     plt.close()
 
 
-def plot_overall_degradation(overall_deg: pd.DataFrame, output_path: Path) -> None:
+def plot_overall_degradation(
+    overall_delta_df: pd.DataFrame,
+    output_path: Path,
+) -> None:
     metrics = [
-        "child_coverage_rate_delta_vs_baseline",
-        "child_accuracy_delta_vs_baseline",
-        "rollup_coverage_rate_delta_vs_baseline",
-        "rollup_accuracy_delta_vs_baseline",
+        "coverage_delta_vs_baseline",
+        "accuracy_delta_vs_baseline",
+        "f1_balanced_score_delta_vs_baseline",
+        "f2_coverage_weighted_score_delta_vs_baseline",
     ]
 
-    plot_df = overall_deg[overall_deg["result_name"] != "Baseline"].copy()
-    plot_df = plot_df.set_index("result_name")[metrics]
+    plot_df = overall_delta_df[overall_delta_df["result_name"] != BASELINE_NAME].copy()
 
-    ax = plot_df.plot(kind="bar", figsize=(12, 6))
+    if plot_df.empty:
+        print("SKIP overall degradation plot: no stress rows.")
+        return
+
+    plot_df = plot_df.set_index("result_name")
+
+    order = [x for x in RESULT_ORDER if x != BASELINE_NAME and x in plot_df.index]
+    plot_df = plot_df.loc[order]
+
+    for m in metrics:
+        plot_df[m] = pd.to_numeric(plot_df[m], errors="coerce")
+
+    if plot_df[metrics].dropna(how="all").empty:
+        print("SKIP overall degradation plot: no numeric data.")
+        return
+
+    ax = plot_df[metrics].plot(kind="bar", figsize=(12, 6))
     ax.axhline(0, linewidth=1)
     ax.set_title("Overall Degradation vs Baseline")
-    ax.set_xlabel("Stress Test")
+    ax.set_xlabel("Stress Condition")
     ax.set_ylabel("Delta vs Baseline")
     ax.legend(title="Metric", bbox_to_anchor=(1.02, 1), loc="upper left")
+
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
     plt.close()
+
+
+def plot_coverage_accuracy_scatter(
+    overall_df: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    plot_df = overall_df.copy()
+    plot_df["coverage"] = pd.to_numeric(plot_df["coverage"], errors="coerce")
+    plot_df["accuracy"] = pd.to_numeric(plot_df["accuracy"], errors="coerce")
+
+    plot_df = plot_df.dropna(subset=["coverage", "accuracy"])
+
+    if plot_df.empty:
+        print("SKIP coverage-accuracy scatter: no numeric data.")
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    for _, row in plot_df.iterrows():
+        ax.scatter(row["coverage"], row["accuracy"])
+        ax.annotate(
+            row["result_name"],
+            (row["coverage"], row["accuracy"]),
+            xytext=(5, 5),
+            textcoords="offset points",
+        )
+
+    ax.set_title("Overall Accuracy vs Coverage Under Stress")
+    ax.set_xlabel("Coverage")
+    ax.set_ylabel("Accuracy")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+
+
+def plot_stress_frontier(
+    overall_df: pd.DataFrame,
+    metric: str,
+    output_path: Path,
+) -> None:
+    plot_df = overall_df.copy()
+    plot_df[metric] = pd.to_numeric(plot_df[metric], errors="coerce")
+
+    plot_df = plot_df.set_index("result_name")
+    order = [x for x in RESULT_ORDER if x in plot_df.index]
+    plot_df = plot_df.loc[order]
+
+    if plot_df[metric].dropna().empty:
+        print(f"SKIP stress frontier plot: {metric} has no numeric data.")
+        return
+
+    ax = plot_df[metric].plot(kind="line", marker="o", figsize=(10, 5))
+    ax.set_title(f"Overall {metric.replace('_', ' ').title()} Across Stress Levels")
+    ax.set_xlabel("Stress Condition")
+    ax.set_ylabel(metric.replace("_", " ").title())
+    ax.set_ylim(0, 1)
+    ax.grid(True, axis="y", alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+
+
+def generate_plots(
+    by_doc_type_df: pd.DataFrame,
+    by_doc_type_delta_df: pd.DataFrame,
+    overall_df: pd.DataFrame,
+    overall_delta_df: pd.DataFrame,
+) -> None:
+    # By doc type
+    plot_metric_by_doc_type(
+        by_doc_type_df,
+        metric="coverage",
+        title=f"Coverage by Doc Type at Threshold {CONFIDENCE_THRESHOLD}",
+        output_path=PLOT_DIR / "coverage_by_doc_type.png",
+    )
+
+    plot_metric_by_doc_type(
+        by_doc_type_df,
+        metric="accuracy",
+        title=f"Accuracy by Doc Type at Threshold {CONFIDENCE_THRESHOLD}",
+        output_path=PLOT_DIR / "accuracy_by_doc_type.png",
+    )
+
+    plot_metric_by_doc_type(
+        by_doc_type_df,
+        metric="f1_balanced_score",
+        title=f"Balanced Score by Doc Type at Threshold {CONFIDENCE_THRESHOLD}",
+        output_path=PLOT_DIR / "balanced_score_by_doc_type.png",
+    )
+
+    plot_metric_by_doc_type(
+        by_doc_type_df,
+        metric="f2_coverage_weighted_score",
+        title=f"Coverage-Weighted Score by Doc Type at Threshold {CONFIDENCE_THRESHOLD}",
+        output_path=PLOT_DIR / "coverage_weighted_score_by_doc_type.png",
+    )
+
+    # Deltas by doc type
+    plot_delta_by_doc_type(
+        by_doc_type_delta_df,
+        metric_delta="coverage_delta_vs_baseline",
+        title="Coverage Degradation vs Baseline by Doc Type",
+        output_path=PLOT_DIR / "coverage_delta_vs_baseline_by_doc_type.png",
+    )
+
+    plot_delta_by_doc_type(
+        by_doc_type_delta_df,
+        metric_delta="accuracy_delta_vs_baseline",
+        title="Accuracy Degradation vs Baseline by Doc Type",
+        output_path=PLOT_DIR / "accuracy_delta_vs_baseline_by_doc_type.png",
+    )
+
+    plot_delta_by_doc_type(
+        by_doc_type_delta_df,
+        metric_delta="f1_balanced_score_delta_vs_baseline",
+        title="Balanced Score Degradation vs Baseline by Doc Type",
+        output_path=PLOT_DIR / "balanced_score_delta_vs_baseline_by_doc_type.png",
+    )
+
+    plot_delta_by_doc_type(
+        by_doc_type_delta_df,
+        metric_delta="f2_coverage_weighted_score_delta_vs_baseline",
+        title="Coverage-Weighted Score Degradation vs Baseline by Doc Type",
+        output_path=PLOT_DIR / "coverage_weighted_score_delta_vs_baseline_by_doc_type.png",
+    )
+
+    # Overall
+    plot_overall_metric(
+        overall_df,
+        metric="coverage",
+        title="Overall Coverage Under Stress",
+        output_path=PLOT_DIR / "overall_coverage_under_stress.png",
+    )
+
+    plot_overall_metric(
+        overall_df,
+        metric="accuracy",
+        title="Overall Accuracy Under Stress",
+        output_path=PLOT_DIR / "overall_accuracy_under_stress.png",
+    )
+
+    plot_overall_metric(
+        overall_df,
+        metric="f1_balanced_score",
+        title="Overall Balanced Score Under Stress",
+        output_path=PLOT_DIR / "overall_balanced_score_under_stress.png",
+    )
+
+    plot_overall_degradation(
+        overall_delta_df,
+        output_path=PLOT_DIR / "overall_degradation_vs_baseline.png",
+    )
+
+    plot_coverage_accuracy_scatter(
+        overall_df,
+        output_path=PLOT_DIR / "overall_coverage_vs_accuracy_scatter.png",
+    )
+
+    # Trend/frontier by severity
+    plot_stress_frontier(
+        overall_df,
+        metric="coverage",
+        output_path=PLOT_DIR / "overall_coverage_stress_frontier.png",
+    )
+
+    plot_stress_frontier(
+        overall_df,
+        metric="accuracy",
+        output_path=PLOT_DIR / "overall_accuracy_stress_frontier.png",
+    )
+
+    plot_stress_frontier(
+        overall_df,
+        metric="f1_balanced_score",
+        output_path=PLOT_DIR / "overall_balanced_score_stress_frontier.png",
+    )
+
+    plot_stress_frontier(
+        overall_df,
+        metric="f2_coverage_weighted_score",
+        output_path=PLOT_DIR / "overall_coverage_weighted_score_stress_frontier.png",
+    )
 
 
 # =========================================================
 # MAIN
 # =========================================================
 
-if __name__ == "__main__":
-    metrics_df = evaluate_all_results()
-    metrics_df.to_csv(OUTPUT_DIR / "stress_test_metrics_by_doc_type.csv", index=False)
+def run_stress_test_analysis() -> None:
+    by_doc_type_df = evaluate_all_stress_results()
 
-    degradation_df = add_degradation_vs_baseline(metrics_df, baseline_name="Baseline")
-    degradation_df.to_csv(OUTPUT_DIR / "stress_test_degradation_by_doc_type.csv", index=False)
+    by_doc_type_out = OUTPUT_DIR / "stress_metrics_by_doc_type.csv"
+    by_doc_type_df.to_csv(by_doc_type_out, index=False)
+    print(f"Saved {by_doc_type_out}")
 
-    overall_df = build_overall_metrics(metrics_df)
-    overall_df.to_csv(OUTPUT_DIR / "stress_test_metrics_overall.csv", index=False)
+    overall_df = build_overall_metrics(by_doc_type_df)
 
-    overall_deg_df = add_degradation_vs_baseline(overall_df, baseline_name="Baseline")
-    overall_deg_df.to_csv(OUTPUT_DIR / "stress_test_degradation_overall.csv", index=False)
+    overall_out = OUTPUT_DIR / "stress_metrics_overall.csv"
+    overall_df.to_csv(overall_out, index=False)
+    print(f"Saved {overall_out}")
 
-    # Metric plots by doc type
-    plot_metric_by_doc_type(
-        metrics_df,
-        metric="child_accuracy",
-        title=f"Child-Level Accuracy by Doc Type at Confidence ≥ {CONFIDENCE_THRESHOLD}",
-        output_path=OUTPUT_DIR / "child_accuracy_by_doc_type.png",
+    by_doc_type_delta_df = add_delta_vs_baseline(
+        by_doc_type_df,
+        baseline_name=BASELINE_NAME,
     )
 
-    plot_metric_by_doc_type(
-        metrics_df,
-        metric="child_coverage_rate",
-        title=f"Child-Level Coverage Rate by Doc Type at Confidence ≥ {CONFIDENCE_THRESHOLD}",
-        output_path=OUTPUT_DIR / "child_coverage_by_doc_type.png",
-    )
+    by_doc_type_delta_out = OUTPUT_DIR / "stress_delta_vs_baseline_by_doc_type.csv"
+    by_doc_type_delta_df.to_csv(by_doc_type_delta_out, index=False)
+    print(f"Saved {by_doc_type_delta_out}")
 
-    plot_metric_by_doc_type(
-        metrics_df,
-        metric="rollup_accuracy",
-        title=f"Rollup Accuracy by Doc Type at Confidence ≥ {CONFIDENCE_THRESHOLD}",
-        output_path=OUTPUT_DIR / "rollup_accuracy_by_doc_type.png",
-    )
-
-    plot_metric_by_doc_type(
-        metrics_df,
-        metric="rollup_coverage_rate",
-        title=f"Rollup Coverage Rate by Doc Type at Confidence ≥ {CONFIDENCE_THRESHOLD}",
-        output_path=OUTPUT_DIR / "rollup_coverage_by_doc_type.png",
-    )
-
-    # Degradation plots by doc type
-    plot_degradation_delta(
-        degradation_df,
-        metric_delta="child_accuracy_delta_vs_baseline",
-        title="Child-Level Accuracy Degradation vs Baseline",
-        output_path=OUTPUT_DIR / "child_accuracy_degradation_vs_baseline.png",
-    )
-
-    plot_degradation_delta(
-        degradation_df,
-        metric_delta="child_coverage_rate_delta_vs_baseline",
-        title="Child-Level Coverage Rate Degradation vs Baseline",
-        output_path=OUTPUT_DIR / "child_coverage_degradation_vs_baseline.png",
-    )
-
-    plot_degradation_delta(
-        degradation_df,
-        metric_delta="rollup_accuracy_delta_vs_baseline",
-        title="Rollup Accuracy Degradation vs Baseline",
-        output_path=OUTPUT_DIR / "rollup_accuracy_degradation_vs_baseline.png",
-    )
-
-    plot_degradation_delta(
-        degradation_df,
-        metric_delta="rollup_coverage_rate_delta_vs_baseline",
-        title="Rollup Coverage Rate Degradation vs Baseline",
-        output_path=OUTPUT_DIR / "rollup_coverage_degradation_vs_baseline.png",
-    )
-
-    # Overall plots
-    plot_overall_metrics(
+    overall_delta_df = add_delta_vs_baseline(
         overall_df,
-        output_path=OUTPUT_DIR / "overall_metrics_under_stress.png",
+        baseline_name=BASELINE_NAME,
     )
 
-    plot_overall_degradation(
-        overall_deg_df,
-        output_path=OUTPUT_DIR / "overall_degradation_vs_baseline.png",
+    overall_delta_out = OUTPUT_DIR / "stress_delta_vs_baseline_overall.csv"
+    overall_delta_df.to_csv(overall_delta_out, index=False)
+    print(f"Saved {overall_delta_out}")
+
+    generate_plots(
+        by_doc_type_df=by_doc_type_df,
+        by_doc_type_delta_df=by_doc_type_delta_df,
+        overall_df=overall_df,
+        overall_delta_df=overall_delta_df,
     )
 
-    print(f"Saved outputs to: {OUTPUT_DIR.resolve()}")
+    print("\nSaved CSV outputs to:")
+    print(OUTPUT_DIR.resolve())
+
+    print("\nSaved plots to:")
+    print(PLOT_DIR.resolve())
+
+
+if __name__ == "__main__":
+    run_stress_test_analysis()
