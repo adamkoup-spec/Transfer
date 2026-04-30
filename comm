@@ -1,0 +1,15 @@
+Performance Analysis
+
+In addition to the aggregate performance comparison discussed above, MRM performed a more granular error decomposition by document type. The chart below breaks the results into correct predictions, incorrect predictions, explicit low-confidence exclusions, and missing outputs to better identify the main drivers of performance gaps.
+
+Benchmark Analysis
+
+MRM compared the production model against alternative benchmark configurations across the three document types. The chart below summarizes the F1 balanced score for each configuration. In this analysis, F1 refers to the harmonic mean of coverage and accuracy, providing a single measure that penalizes both low coverage and low correctness.
+
+Stability Analysis
+
+MRM evaluated run-to-run stability by repeating the extraction process and comparing the F1 balanced score across runs. In this context, F1 combines coverage and accuracy into one balanced metric, allowing MRM to assess whether overall performance remains consistent across repeated executions for each document type.
+
+Stress Test Analysis
+
+MRM assessed robustness by applying increasing levels of document distortion and comparing performance against the baseline run. The chart below shows the F1 balanced score under baseline, light, medium, and heavy noise conditions for each document type, where F1 combines coverage and accuracy into a single performance measure.
