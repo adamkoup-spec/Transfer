@@ -1,0 +1,1010 @@
+import json
+import math
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+
+RESULTS_ROOT = Path(r"C:\path\to\results")
+GROUND_TRUTH_ROOT = Path(r"C:\path\to\ground_truth")
+
+ROUTES_BY_FOLDER = {
+    "A": "response.output",
+    "B": "prediction.final",
+    "C": "data.items",
+}
+
+CONFIDENCE_THRESHOLDS = [0, 50, 60, 70, 80, 90, 95]
+DEFAULT_PLOT_THRESHOLD = 80
+
+CONFIDENCE_IS_PROBABILITY = False
+
+STRIP_STRINGS = True
+CASE_INSENSITIVE_STRINGS = False
+
+OUTPUT_DIR = Path("./performance_output")
+PLOT_DIR = OUTPUT_DIR / "plots"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+PLOT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# =========================================================
+# MANUAL OFFSETS
+# =========================================================
+# Doc-type-level offsets affect doc-type summary and overall summary.
+#
+# Example:
+# MANUAL_OFFSETS_BY_DOC_TYPE = {
+#     "A": {"correct_offset": 5},
+#     "B": {"correct_offset": 0},
+#     "C": {"correct_offset": 2},
+# }
+#
+# Field-level offsets affect field-level summaries and field-error plots.
+#
+# Example:
+# MANUAL_OFFSETS_BY_FIELD = {
+#     ("A", "address.state"): {"correct_offset": 3},
+#     ("B", "business_address.line2"): {"correct_offset": 2},
+# }
+#
+# The offset means: "after manual review, add this many correct matches."
+# Correct values are capped at covered count.
+# =========================================================
+
+MANUAL_OFFSETS_BY_DOC_TYPE = {
+    "A": {"correct_offset": 0},
+    "B": {"correct_offset": 0},
+    "C": {"correct_offset": 0},
+}
+
+MANUAL_OFFSETS_BY_FIELD = {
+    # ("A", "address.state"): {"correct_offset": 3},
+}
+
+
+# =========================================================
+# BASIC HELPERS
+# =========================================================
+
+def load_json(path: Path) -> Any:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def normalize_value(x: Any) -> Any:
+    if isinstance(x, str):
+        if STRIP_STRINGS:
+            x = x.strip()
+        if CASE_INSENSITIVE_STRINGS:
+            x = x.lower()
+    return x
+
+
+def get_by_route(obj: Any, route: str) -> Any:
+    cur = obj
+
+    if route is None or route == "":
+        return cur
+
+    for part in route.split("."):
+        if isinstance(cur, dict):
+            if part not in cur:
+                return None
+            cur = cur[part]
+
+        elif isinstance(cur, list):
+            if not part.isdigit():
+                return None
+            idx = int(part)
+            if idx < 0 or idx >= len(cur):
+                return None
+            cur = cur[idx]
+
+        else:
+            return None
+
+    return cur
+
+
+def list_relative_jsons(folder: Path) -> List[Path]:
+    if not folder.exists():
+        return []
+    return sorted([p.relative_to(folder) for p in folder.rglob("*.json")])
+
+
+def coerce_confidence(x: Any) -> Optional[float]:
+    if x is None:
+        return None
+
+    try:
+        val = float(x)
+    except Exception:
+        return None
+
+    if math.isnan(val):
+        return None
+
+    if CONFIDENCE_IS_PROBABILITY:
+        val *= 100.0
+
+    return val
+
+
+def find_all_confidences(obj: Any) -> List[float]:
+    confidences = []
+
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == "confidence":
+                c = coerce_confidence(v)
+                if c is not None:
+                    confidences.append(c)
+            else:
+                confidences.extend(find_all_confidences(v))
+
+    elif isinstance(obj, list):
+        for item in obj:
+            confidences.extend(find_all_confidences(item))
+
+    return confidences
+
+
+def extract_node_confidence(obj: Any) -> Optional[float]:
+    confidences = find_all_confidences(obj)
+    if not confidences:
+        return None
+    return max(confidences)
+
+
+def fbeta_score(
+    accuracy: Optional[float],
+    coverage: Optional[float],
+    beta: float = 1.0,
+) -> Optional[float]:
+    if accuracy is None or coverage is None:
+        return None
+
+    if accuracy == 0 and coverage == 0:
+        return 0.0
+
+    beta2 = beta ** 2
+    denom = beta2 * accuracy + coverage
+
+    if denom == 0:
+        return 0.0
+
+    return (1 + beta2) * accuracy * coverage / denom
+
+
+def get_doc_offset(doc_type: str) -> int:
+    return int(MANUAL_OFFSETS_BY_DOC_TYPE.get(doc_type, {}).get("correct_offset", 0))
+
+
+def get_field_offset(doc_type: str, field: str) -> int:
+    return int(MANUAL_OFFSETS_BY_FIELD.get((doc_type, field), {}).get("correct_offset", 0))
+
+
+def add_bar_labels(ax, fmt="%.2f", fontsize=8):
+    for container in ax.containers:
+        ax.bar_label(container, fmt=fmt, fontsize=fontsize, padding=2)
+
+
+# =========================================================
+# FLATTENING
+# =========================================================
+
+def flatten_prediction_value_paths(
+    obj: Any,
+    parent_key: str = "",
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Finds all leaf dicts containing 'value'.
+
+    A prediction node exists even if value is None.
+    Confidence is found anywhere under the same node.
+    """
+    items = {}
+
+    if isinstance(obj, dict):
+        if "value" in obj:
+            clean_key = parent_key if parent_key else "value"
+            raw_value = obj.get("value")
+            confidence = extract_node_confidence(obj)
+
+            items[clean_key] = {
+                "value": normalize_value(raw_value),
+                "confidence": confidence,
+                "has_confidence": confidence is not None,
+            }
+
+        for k, v in obj.items():
+            if k == "value":
+                continue
+
+            new_key = f"{parent_key}.{k}" if parent_key else k
+            items.update(flatten_prediction_value_paths(v, new_key))
+
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            new_key = f"{parent_key}.{i}" if parent_key else str(i)
+            items.update(flatten_prediction_value_paths(v, new_key))
+
+    return items
+
+
+def flatten_gt_value_paths(
+    obj: Any,
+    parent_key: str = "",
+) -> Dict[str, Any]:
+    """
+    Finds all GT leaf dicts containing 'value'.
+    """
+    items = {}
+
+    if isinstance(obj, dict):
+        if "value" in obj:
+            clean_key = parent_key if parent_key else "value"
+            items[clean_key] = normalize_value(obj.get("value"))
+
+        for k, v in obj.items():
+            if k == "value":
+                continue
+
+            new_key = f"{parent_key}.{k}" if parent_key else k
+            items.update(flatten_gt_value_paths(v, new_key))
+
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            new_key = f"{parent_key}.{i}" if parent_key else str(i)
+            items.update(flatten_gt_value_paths(v, new_key))
+
+    return items
+
+
+# =========================================================
+# STATUS / COVERAGE LOGIC
+# =========================================================
+
+def classify_prediction_status(
+    pred_info: Optional[Dict[str, Any]],
+    threshold: float,
+) -> str:
+    """
+    Rule:
+    - missing prediction -> not covered
+    - explicit confidence below threshold -> not covered
+    - confidence >= threshold -> covered
+    - missing confidence -> covered
+
+    Null value is still a prediction if the node exists.
+    """
+    if pred_info is None:
+        return "missing_pred"
+
+    confidence = pred_info.get("confidence")
+
+    if confidence is not None and confidence < threshold:
+        return "explicit_low_conf"
+
+    if confidence is not None and confidence >= threshold:
+        return "covered_with_confidence"
+
+    return "covered_without_confidence"
+
+
+def is_covered_status(status: str) -> bool:
+    return status in {
+        "covered_with_confidence",
+        "covered_without_confidence",
+    }
+
+
+# =========================================================
+# FILE-LEVEL EVALUATION
+# =========================================================
+
+def evaluate_one_file(
+    doc_type: str,
+    file_name: str,
+    gt_flat: Dict[str, Any],
+    pred_flat: Dict[str, Dict[str, Any]],
+    threshold: float,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """
+    Returns:
+      file-level summary dict
+      long field-level record list
+    """
+    all_fields = sorted(set(gt_flat.keys()) | set(pred_flat.keys()))
+
+    total = len(all_fields)
+    covered = 0
+    correct_raw = 0
+
+    missing_pred = 0
+    explicit_low_conf = 0
+    covered_with_confidence = 0
+    covered_without_confidence = 0
+
+    null_gt_fields = 0
+    null_pred_covered = 0
+    null_pred_correct = 0
+    prediction_only_fields = 0
+
+    field_rows = []
+
+    for field in all_fields:
+        gt_present = field in gt_flat
+        pred_present = field in pred_flat
+
+        gt_val = gt_flat.get(field)
+        pred_info = pred_flat.get(field)
+        pred_val = pred_info.get("value") if pred_info is not None else None
+        confidence = pred_info.get("confidence") if pred_info is not None else None
+
+        if gt_present and gt_val is None:
+            null_gt_fields += 1
+
+        if pred_present and not gt_present:
+            prediction_only_fields += 1
+
+        status = classify_prediction_status(pred_info, threshold)
+        covered_flag = is_covered_status(status)
+
+        match_raw = None
+
+        if covered_flag:
+            covered += 1
+            match_raw = pred_val == gt_val
+
+            if match_raw:
+                correct_raw += 1
+
+            if pred_val is None:
+                null_pred_covered += 1
+                if match_raw:
+                    null_pred_correct += 1
+
+            if status == "covered_with_confidence":
+                covered_with_confidence += 1
+            elif status == "covered_without_confidence":
+                covered_without_confidence += 1
+
+        else:
+            if status == "missing_pred":
+                missing_pred += 1
+            elif status == "explicit_low_conf":
+                explicit_low_conf += 1
+
+        field_rows.append({
+            "doc_type": doc_type,
+            "file": file_name,
+            "threshold": threshold,
+            "field": field,
+
+            "gt_present": gt_present,
+            "pred_present": pred_present,
+            "gt_value": gt_val,
+            "pred_value": pred_val,
+            "confidence": confidence,
+
+            "status": status,
+            "covered": covered_flag,
+            "match_raw": match_raw,
+        })
+
+    correct = correct_raw
+    coverage = covered / total if total else None
+    accuracy = correct / covered if covered else None
+
+    file_summary = {
+        "doc_type": doc_type,
+        "file": file_name,
+        "threshold": threshold,
+        "status": "OK",
+
+        "total": total,
+        "covered": covered,
+        "correct_raw": correct_raw,
+        "correct_manual_offset": 0,
+        "correct": correct,
+
+        "coverage": coverage,
+        "accuracy": accuracy,
+        "f1_balanced_score": fbeta_score(accuracy, coverage, beta=1.0),
+        "f2_coverage_weighted_score": fbeta_score(accuracy, coverage, beta=2.0),
+
+        "missing_pred": missing_pred,
+        "explicit_low_conf": explicit_low_conf,
+        "covered_with_confidence": covered_with_confidence,
+        "covered_without_confidence": covered_without_confidence,
+
+        "null_gt_fields": null_gt_fields,
+        "null_pred_covered": null_pred_covered,
+        "null_pred_correct": null_pred_correct,
+        "prediction_only_fields": prediction_only_fields,
+    }
+
+    return file_summary, field_rows
+
+
+# =========================================================
+# MAIN EVALUATION
+# =========================================================
+
+def run_raw_performance_evaluation() -> Tuple[pd.DataFrame, pd.DataFrame]:
+    file_rows = []
+    field_rows = []
+
+    for threshold in CONFIDENCE_THRESHOLDS:
+        print(f"\n=== Threshold {threshold} ===")
+
+        for doc_type, route in ROUTES_BY_FOLDER.items():
+            print(f"Doc type: {doc_type}")
+
+            result_folder = RESULTS_ROOT / doc_type
+            gt_folder = GROUND_TRUTH_ROOT / doc_type
+
+            result_files = set(list_relative_jsons(result_folder))
+            gt_files = set(list_relative_jsons(gt_folder))
+
+            common_files = sorted([p for p in result_files if p in gt_files])
+
+            for rel_path in common_files:
+                pred_path = result_folder / rel_path
+                gt_path = gt_folder / rel_path
+
+                try:
+                    pred_json = load_json(pred_path)
+                    gt_json = load_json(gt_path)
+                except Exception as e:
+                    file_rows.append({
+                        "doc_type": doc_type,
+                        "file": str(rel_path),
+                        "threshold": threshold,
+                        "status": f"read_error: {e}",
+                    })
+                    continue
+
+                pred_subtree = get_by_route(pred_json, route)
+                gt_subtree = get_by_route(gt_json, route)
+
+                if pred_subtree is None:
+                    file_rows.append({
+                        "doc_type": doc_type,
+                        "file": str(rel_path),
+                        "threshold": threshold,
+                        "status": "missing_route_in_prediction",
+                    })
+                    continue
+
+                if gt_subtree is None:
+                    file_rows.append({
+                        "doc_type": doc_type,
+                        "file": str(rel_path),
+                        "threshold": threshold,
+                        "status": "missing_route_in_gt",
+                    })
+                    continue
+
+                pred_flat = flatten_prediction_value_paths(pred_subtree)
+                gt_flat = flatten_gt_value_paths(gt_subtree)
+
+                file_summary, long_fields = evaluate_one_file(
+                    doc_type=doc_type,
+                    file_name=str(rel_path),
+                    gt_flat=gt_flat,
+                    pred_flat=pred_flat,
+                    threshold=threshold,
+                )
+
+                file_rows.append(file_summary)
+                field_rows.extend(long_fields)
+
+            # diagnostic only
+            for rel_path in sorted(result_files - gt_files):
+                file_rows.append({
+                    "doc_type": doc_type,
+                    "file": str(rel_path),
+                    "threshold": threshold,
+                    "status": "result_file_without_matching_gt_ignored",
+                })
+
+    return pd.DataFrame(file_rows), pd.DataFrame(field_rows)
+
+
+# =========================================================
+# APPLY OFFSETS
+# =========================================================
+
+def apply_field_offsets(field_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Applies field-level offsets by flipping some errors to correct at the aggregate level.
+
+    Since offsets are aggregate, this creates adjusted field-level summary later.
+    It does not alter row-level match values.
+    """
+    out = field_df.copy()
+    out["field_correct_offset"] = out.apply(
+        lambda r: get_field_offset(r["doc_type"], r["field"]),
+        axis=1,
+    )
+    return out
+
+
+def build_doc_type_summary(file_df: pd.DataFrame) -> pd.DataFrame:
+    ok_df = file_df[file_df["status"] == "OK"].copy()
+
+    rows = []
+
+    for (doc_type, threshold), g in ok_df.groupby(["doc_type", "threshold"], dropna=False):
+        total = int(g["total"].sum())
+        covered = int(g["covered"].sum())
+        correct_raw = int(g["correct_raw"].sum())
+
+        manual_offset = get_doc_offset(doc_type)
+        correct = min(correct_raw + manual_offset, covered)
+
+        coverage = covered / total if total else None
+        accuracy = correct / covered if covered else None
+
+        rows.append({
+            "doc_type": doc_type,
+            "threshold": threshold,
+            "files_compared": len(g),
+
+            "total": total,
+            "covered": covered,
+            "correct_raw": correct_raw,
+            "correct_manual_offset": manual_offset,
+            "correct": correct,
+
+            "coverage": coverage,
+            "accuracy": accuracy,
+            "f1_balanced_score": fbeta_score(accuracy, coverage, beta=1.0),
+            "f2_coverage_weighted_score": fbeta_score(accuracy, coverage, beta=2.0),
+
+            "missing_pred": int(g["missing_pred"].sum()),
+            "explicit_low_conf": int(g["explicit_low_conf"].sum()),
+            "covered_with_confidence": int(g["covered_with_confidence"].sum()),
+            "covered_without_confidence": int(g["covered_without_confidence"].sum()),
+
+            "null_gt_fields": int(g["null_gt_fields"].sum()),
+            "null_pred_covered": int(g["null_pred_covered"].sum()),
+            "null_pred_correct": int(g["null_pred_correct"].sum()),
+            "prediction_only_fields": int(g["prediction_only_fields"].sum()),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def build_overall_summary(summary_df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+
+    for threshold, g in summary_df.groupby("threshold", dropna=False):
+        total = int(g["total"].sum())
+        covered = int(g["covered"].sum())
+        correct_raw = int(g["correct_raw"].sum())
+        manual_offset = int(g["correct_manual_offset"].sum())
+        correct = int(g["correct"].sum())
+
+        coverage = covered / total if total else None
+        accuracy = correct / covered if covered else None
+
+        rows.append({
+            "doc_type": "OVERALL",
+            "threshold": threshold,
+            "files_compared": int(g["files_compared"].sum()),
+
+            "total": total,
+            "covered": covered,
+            "correct_raw": correct_raw,
+            "correct_manual_offset": manual_offset,
+            "correct": correct,
+
+            "coverage": coverage,
+            "accuracy": accuracy,
+            "f1_balanced_score": fbeta_score(accuracy, coverage, beta=1.0),
+            "f2_coverage_weighted_score": fbeta_score(accuracy, coverage, beta=2.0),
+
+            "missing_pred": int(g["missing_pred"].sum()),
+            "explicit_low_conf": int(g["explicit_low_conf"].sum()),
+            "covered_with_confidence": int(g["covered_with_confidence"].sum()),
+            "covered_without_confidence": int(g["covered_without_confidence"].sum()),
+
+            "null_gt_fields": int(g["null_gt_fields"].sum()),
+            "null_pred_covered": int(g["null_pred_covered"].sum()),
+            "null_pred_correct": int(g["null_pred_correct"].sum()),
+            "prediction_only_fields": int(g["prediction_only_fields"].sum()),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def build_field_summary(field_df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+
+    for (doc_type, threshold, field), g in field_df.groupby(["doc_type", "threshold", "field"], dropna=False):
+        total = len(g)
+        covered = int((g["covered"] == True).sum())
+        correct_raw = int(((g["covered"] == True) & (g["match_raw"] == True)).sum())
+
+        field_offset = get_field_offset(doc_type, field)
+        correct = min(correct_raw + field_offset, covered)
+
+        coverage = covered / total if total else None
+        accuracy = correct / covered if covered else None
+
+        incorrect_covered = max(covered - correct, 0)
+        explicit_low_conf = int((g["status"] == "explicit_low_conf").sum())
+        missing_pred = int((g["status"] == "missing_pred").sum())
+        adjusted_errors = incorrect_covered + explicit_low_conf + missing_pred
+
+        rows.append({
+            "doc_type": doc_type,
+            "threshold": threshold,
+            "field": field,
+
+            "total": total,
+            "covered": covered,
+            "correct_raw": correct_raw,
+            "correct_manual_offset": field_offset,
+            "correct": correct,
+
+            "coverage": coverage,
+            "accuracy": accuracy,
+            "f1_balanced_score": fbeta_score(accuracy, coverage, beta=1.0),
+            "f2_coverage_weighted_score": fbeta_score(accuracy, coverage, beta=2.0),
+
+            "incorrect_covered": incorrect_covered,
+            "explicit_low_conf": explicit_low_conf,
+            "missing_pred": missing_pred,
+            "adjusted_errors": adjusted_errors,
+        })
+
+    out = pd.DataFrame(rows)
+
+    if not out.empty:
+        out = out.sort_values(
+            ["threshold", "adjusted_errors"],
+            ascending=[True, False],
+        ).reset_index(drop=True)
+
+    return out
+
+
+# =========================================================
+# PLOTS
+# =========================================================
+
+def plot_basic_bars(summary_df: pd.DataFrame, threshold: int):
+    df = summary_df[
+        (summary_df["threshold"] == threshold)
+        & (summary_df["doc_type"] != "OVERALL")
+    ].copy()
+
+    for metric in ["coverage", "accuracy", "f1_balanced_score", "f2_coverage_weighted_score"]:
+        df[metric] = pd.to_numeric(df[metric], errors="coerce")
+
+        if df[metric].dropna().empty:
+            continue
+
+        ax = df.plot(
+            x="doc_type",
+            y=metric,
+            kind="bar",
+            figsize=(10, 5),
+            legend=False,
+        )
+
+        add_bar_labels(ax, fmt="%.2f")
+
+        ax.set_title(f"{metric.replace('_', ' ').title()} by Document Type at Threshold {threshold}")
+        ax.set_xlabel("Document Type")
+        ax.set_ylabel(metric.replace("_", " ").title())
+        ax.set_ylim(0, 1.10)
+
+        plt.tight_layout()
+        out = PLOT_DIR / f"basic_{metric}_t{threshold}.png"
+        plt.savefig(out, dpi=150)
+        plt.close()
+
+
+def plot_threshold_curves(final_summary_df: pd.DataFrame):
+    df = final_summary_df.copy()
+
+    for metric in ["coverage", "accuracy", "f1_balanced_score", "f2_coverage_weighted_score"]:
+        pivot = df.pivot(index="threshold", columns="doc_type", values=metric)
+
+        if pivot.dropna(how="all").empty:
+            continue
+
+        ax = pivot.plot(kind="line", marker="o", figsize=(11, 6))
+        ax.set_title(f"{metric.replace('_', ' ').title()} Across Thresholds")
+        ax.set_xlabel("Confidence Threshold")
+        ax.set_ylabel(metric.replace("_", " ").title())
+        ax.set_ylim(0, 1.05)
+        ax.legend(title="Doc Type", bbox_to_anchor=(1.02, 1), loc="upper left")
+
+        plt.tight_layout()
+        out = PLOT_DIR / f"threshold_curve_{metric}.png"
+        plt.savefig(out, dpi=150)
+        plt.close()
+
+
+def plot_error_composition(summary_df: pd.DataFrame, threshold: int):
+    df = summary_df[
+        (summary_df["threshold"] == threshold)
+        & (summary_df["doc_type"] != "OVERALL")
+    ].copy()
+
+    if df.empty:
+        return
+
+    df["incorrect_covered"] = df["covered"] - df["correct"]
+
+    plot_df = df.set_index("doc_type")[
+        ["correct", "incorrect_covered", "explicit_low_conf", "missing_pred"]
+    ].apply(pd.to_numeric, errors="coerce").fillna(0)
+
+    ax = plot_df.plot(kind="bar", stacked=True, figsize=(12, 6))
+
+    ax.set_title(f"Error Composition by Document Type at Threshold {threshold}")
+    ax.set_xlabel("Document Type")
+    ax.set_ylabel("Leaf Node Count")
+    ax.legend(
+        ["Correct", "Incorrect Covered", "Explicit Low Confidence", "Missing Prediction"],
+        bbox_to_anchor=(1.02, 1),
+        loc="upper left",
+    )
+
+    plt.tight_layout()
+    out = PLOT_DIR / f"error_composition_t{threshold}.png"
+    plt.savefig(out, dpi=150)
+    plt.close()
+
+
+def confidence_bucket(x):
+    if pd.isna(x):
+        return "Missing"
+    if x < 50:
+        return "<50"
+    if x < 60:
+        return "50-60"
+    if x < 70:
+        return "60-70"
+    if x < 80:
+        return "70-80"
+    if x < 90:
+        return "80-90"
+    return "90-100"
+
+
+CONFIDENCE_BUCKET_ORDER = ["<50", "50-60", "60-70", "70-80", "80-90", "90-100", "Missing"]
+
+
+def plot_confidence_bucket_accuracy(field_df: pd.DataFrame, threshold: int):
+    df = field_df[field_df["threshold"] == threshold].copy()
+    df = df[df["covered"] == True].copy()
+
+    if df.empty:
+        return
+
+    df["confidence"] = pd.to_numeric(df["confidence"], errors="coerce")
+    df["bucket"] = df["confidence"].apply(confidence_bucket)
+
+    grouped = (
+        df.groupby("bucket", dropna=False)
+        .agg(
+            count=("match_raw", "size"),
+            correct=("match_raw", lambda x: pd.Series(x).fillna(False).astype(bool).sum()),
+        )
+        .reset_index()
+    )
+
+    grouped["observed_accuracy"] = grouped["correct"] / grouped["count"]
+    grouped["bucket"] = pd.Categorical(grouped["bucket"], categories=CONFIDENCE_BUCKET_ORDER, ordered=True)
+    grouped = grouped.sort_values("bucket")
+
+    ax = grouped.plot(x="bucket", y="observed_accuracy", kind="bar", figsize=(10, 5), legend=False)
+
+    add_bar_labels(ax, fmt="%.2f")
+
+    ax.set_title(f"Observed Accuracy by Confidence Bucket at Threshold {threshold}")
+    ax.set_xlabel("Confidence Bucket")
+    ax.set_ylabel("Observed Accuracy")
+    ax.set_ylim(0, 1.10)
+
+    plt.tight_layout()
+    out = PLOT_DIR / f"confidence_bucket_accuracy_t{threshold}.png"
+    plt.savefig(out, dpi=150)
+    plt.close()
+
+    grouped.to_csv(PLOT_DIR / f"confidence_bucket_accuracy_t{threshold}.csv", index=False)
+
+
+def plot_file_level_distributions(file_df: pd.DataFrame, threshold: int):
+    df = file_df[
+        (file_df["threshold"] == threshold)
+        & (file_df["status"] == "OK")
+    ].copy()
+
+    if df.empty:
+        return
+
+    for metric in ["coverage", "accuracy", "f1_balanced_score", "f2_coverage_weighted_score"]:
+        df[metric] = pd.to_numeric(df[metric], errors="coerce")
+
+        labels = sorted(df["doc_type"].unique())
+        values = [
+            df.loc[df["doc_type"] == label, metric].dropna().values
+            for label in labels
+        ]
+
+        if not any(len(v) for v in values):
+            continue
+
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.boxplot(values, labels=labels, showmeans=True)
+        ax.set_title(f"File-Level Distribution of {metric.replace('_', ' ').title()} at Threshold {threshold}")
+        ax.set_xlabel("Document Type")
+        ax.set_ylabel(metric.replace("_", " ").title())
+        ax.set_ylim(0, 1.05)
+
+        plt.tight_layout()
+        out = PLOT_DIR / f"file_boxplot_{metric}_t{threshold}.png"
+        plt.savefig(out, dpi=150)
+        plt.close()
+
+
+def plot_top_error_fields(field_summary_df: pd.DataFrame, threshold: int, top_n: int = 25):
+    df = field_summary_df[field_summary_df["threshold"] == threshold].copy()
+    df = df[df["adjusted_errors"] > 0].copy()
+
+    if df.empty:
+        return
+
+    df = df.sort_values("adjusted_errors", ascending=False).head(top_n)
+    df["display"] = df["doc_type"] + " | " + df["field"].astype(str)
+
+    ax = df.sort_values("adjusted_errors").plot(
+        x="display",
+        y="adjusted_errors",
+        kind="barh",
+        figsize=(12, max(6, top_n * 0.3)),
+        legend=False,
+    )
+
+    ax.set_title(f"Top {top_n} Error-Contributing Fields at Threshold {threshold}")
+    ax.set_xlabel("Adjusted Error Count")
+    ax.set_ylabel("Doc Type | Field")
+
+    plt.tight_layout()
+    out = PLOT_DIR / f"top_error_fields_t{threshold}.png"
+    plt.savefig(out, dpi=150)
+    plt.close()
+
+
+def plot_pareto_errors(field_summary_df: pd.DataFrame, threshold: int, top_n: int = 30):
+    df = field_summary_df[field_summary_df["threshold"] == threshold].copy()
+    df = df[df["adjusted_errors"] > 0].copy()
+
+    if df.empty:
+        return
+
+    df = df.sort_values("adjusted_errors", ascending=False)
+    total_errors = df["adjusted_errors"].sum()
+    df["error_share"] = df["adjusted_errors"] / total_errors
+    df["cumulative_error_share"] = df["error_share"].cumsum()
+
+    top = df.head(top_n).copy()
+    top["display"] = top["doc_type"] + " | " + top["field"].astype(str)
+
+    fig, ax1 = plt.subplots(figsize=(14, 6))
+
+    ax1.bar(top["display"], top["adjusted_errors"])
+    ax1.set_xlabel("Field")
+    ax1.set_ylabel("Adjusted Error Count")
+    ax1.tick_params(axis="x", rotation=75)
+
+    ax2 = ax1.twinx()
+    ax2.plot(top["display"], top["cumulative_error_share"], marker="o")
+    ax2.set_ylabel("Cumulative Error Share")
+    ax2.set_ylim(0, 1.05)
+
+    ax1.set_title(f"Pareto Chart of Field Errors at Threshold {threshold}")
+
+    plt.tight_layout()
+    out = PLOT_DIR / f"pareto_errors_t{threshold}.png"
+    plt.savefig(out, dpi=150)
+    plt.close()
+
+
+def plot_coverage_accuracy_scatter(summary_df: pd.DataFrame, threshold: int):
+    df = summary_df[
+        (summary_df["threshold"] == threshold)
+        & (summary_df["doc_type"] != "OVERALL")
+    ].copy()
+
+    df["coverage"] = pd.to_numeric(df["coverage"], errors="coerce")
+    df["accuracy"] = pd.to_numeric(df["accuracy"], errors="coerce")
+    df = df.dropna(subset=["coverage", "accuracy"])
+
+    if df.empty:
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    for _, row in df.iterrows():
+        ax.scatter(row["coverage"], row["accuracy"])
+        ax.annotate(row["doc_type"], (row["coverage"], row["accuracy"]), xytext=(5, 5), textcoords="offset points")
+
+    ax.set_title(f"Coverage vs Accuracy by Document Type at Threshold {threshold}")
+    ax.set_xlabel("Coverage")
+    ax.set_ylabel("Accuracy")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+
+    plt.tight_layout()
+    out = PLOT_DIR / f"coverage_accuracy_scatter_t{threshold}.png"
+    plt.savefig(out, dpi=150)
+    plt.close()
+
+
+def generate_all_plots(file_df, field_df, final_summary_df, field_summary_df, threshold: int):
+    plot_basic_bars(final_summary_df, threshold)
+    plot_threshold_curves(final_summary_df)
+    plot_error_composition(final_summary_df, threshold)
+    plot_confidence_bucket_accuracy(field_df, threshold)
+    plot_file_level_distributions(file_df, threshold)
+    plot_top_error_fields(field_summary_df, threshold)
+    plot_pareto_errors(field_summary_df, threshold)
+    plot_coverage_accuracy_scatter(final_summary_df, threshold)
+
+
+# =========================================================
+# RUNNER
+# =========================================================
+
+def run_performance_test_with_offsets_and_plots():
+    file_df, field_df = run_raw_performance_evaluation()
+
+    # Apply field offsets annotation
+    field_df = apply_field_offsets(field_df)
+
+    doc_summary_df = build_doc_type_summary(file_df)
+    overall_summary_df = build_overall_summary(doc_summary_df)
+
+    final_summary_df = pd.concat([doc_summary_df, overall_summary_df], ignore_index=True)
+
+    field_summary_df = build_field_summary(field_df)
+
+    # Save outputs
+    file_df.to_csv(OUTPUT_DIR / "performance_file_level.csv", index=False)
+    field_df.to_csv(OUTPUT_DIR / "performance_field_level_long.csv", index=False)
+    final_summary_df.to_csv(OUTPUT_DIR / "performance_summary.csv", index=False)
+    field_summary_df.to_csv(OUTPUT_DIR / "performance_field_summary.csv", index=False)
+
+    generate_all_plots(
+        file_df=file_df,
+        field_df=field_df,
+        final_summary_df=final_summary_df,
+        field_summary_df=field_summary_df,
+        threshold=DEFAULT_PLOT_THRESHOLD,
+    )
+
+    print("\nSaved outputs to:")
+    print(OUTPUT_DIR.resolve())
+    print("\nSaved plots to:")
+    print(PLOT_DIR.resolve())
+
+
+if __name__ == "__main__":
+    run_performance_test_with_offsets_and_plots()
