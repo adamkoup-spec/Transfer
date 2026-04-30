@@ -1,0 +1,791 @@
+# =========================================================
+# ADD-ON: PERFORMANCE DIAGNOSTIC PLOTS
+# Compatible with final performance code output
+# =========================================================
+
+from pathlib import Path
+from typing import Dict, Optional
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+
+PERFORMANCE_OUTPUT_DIR = Path("./performance_metrics_thresholds_output")
+DIAGNOSTIC_OUTPUT_DIR = PERFORMANCE_OUTPUT_DIR / "diagnostic_plots"
+DIAGNOSTIC_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Use the same default threshold you care about most
+DEFAULT_THRESHOLD_FOR_DIAGNOSTICS = 80
+
+# These files should already be created by the final performance code
+SUMMARY_PATH = PERFORMANCE_OUTPUT_DIR / "performance_summary_all_thresholds.csv"
+ALL_FILES_PATH = PERFORMANCE_OUTPUT_DIR / "performance_all_files_all_thresholds.csv"
+ALL_FIELDS_PATH = PERFORMANCE_OUTPUT_DIR / "performance_all_fields_all_thresholds.csv"
+
+
+# =========================================================
+# MANUAL OFFSETS
+# =========================================================
+# These are for diagnostic/error plots only.
+#
+# correct_offset:
+#   manually verified false mismatches that should be treated as correct.
+#
+# error_offset:
+#   direct adjustment to error count.
+#   Usually this should be negative if manual review removes errors.
+#
+# Example:
+# "A": {"correct_offset": 5, "error_offset": -5}
+#
+# If you only use correct_offset, the code automatically reduces errors by the same amount
+# when applicable.
+# =========================================================
+
+MANUAL_DIAGNOSTIC_OFFSETS_BY_DOC_TYPE = {
+    "A": {"correct_offset": 0, "error_offset": 0},
+    "B": {"correct_offset": 0, "error_offset": 0},
+    "C": {"correct_offset": 0, "error_offset": 0},
+
+    # Example:
+    # "business_address": {"correct_offset": 7, "error_offset": -7},
+}
+
+# Optional field-level offsets.
+# Useful if you manually identify that a specific field had false mismatches.
+#
+# Key format:
+#   (doc_type, field)
+#
+# Example:
+#   ("A", "business_address.state"): {"correct_offset": 4, "error_offset": -4}
+#
+MANUAL_DIAGNOSTIC_OFFSETS_BY_FIELD = {
+    # ("A", "address.state"): {"correct_offset": 3, "error_offset": -3},
+}
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+
+def load_performance_outputs():
+    summary_df = pd.read_csv(SUMMARY_PATH)
+    file_df = pd.read_csv(ALL_FILES_PATH)
+    field_df = pd.read_csv(ALL_FIELDS_PATH)
+    return summary_df, file_df, field_df
+
+
+def safe_numeric(s):
+    return pd.to_numeric(s, errors="coerce")
+
+
+def get_doc_type_offsets(doc_type: str) -> Dict[str, int]:
+    return MANUAL_DIAGNOSTIC_OFFSETS_BY_DOC_TYPE.get(
+        doc_type,
+        {"correct_offset": 0, "error_offset": 0},
+    )
+
+
+def get_field_offsets(doc_type: str, field: str) -> Dict[str, int]:
+    return MANUAL_DIAGNOSTIC_OFFSETS_BY_FIELD.get(
+        (doc_type, field),
+        {"correct_offset": 0, "error_offset": 0},
+    )
+
+
+def apply_error_offsets_to_doc_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds adjusted error columns for diagnostic plots.
+
+    Expected columns:
+      doc_type, total, covered, correct_raw/correct/correct_manual_offset,
+      missing_pred, explicit_low_conf
+
+    Error decomposition:
+      correct
+      incorrect_covered = covered - correct
+      explicit_low_conf
+      missing_pred
+
+    Manual correct offsets reduce incorrect covered errors.
+    """
+    out = df.copy()
+
+    out["total"] = safe_numeric(out["total"]).fillna(0)
+    out["covered"] = safe_numeric(out["covered"]).fillna(0)
+
+    if "correct" in out.columns:
+        out["correct_base"] = safe_numeric(out["correct"]).fillna(0)
+    elif "correct_raw" in out.columns:
+        out["correct_base"] = safe_numeric(out["correct_raw"]).fillna(0)
+    else:
+        out["correct_base"] = 0
+
+    out["missing_pred"] = safe_numeric(out.get("missing_pred", 0)).fillna(0)
+    out["explicit_low_conf"] = safe_numeric(out.get("explicit_low_conf", 0)).fillna(0)
+
+    adjusted_correct = []
+    adjusted_incorrect_covered = []
+    adjusted_total_errors = []
+
+    for _, row in out.iterrows():
+        doc_type = row["doc_type"]
+        offsets = get_doc_type_offsets(doc_type)
+
+        correct_offset = int(offsets.get("correct_offset", 0))
+        error_offset = int(offsets.get("error_offset", 0))
+
+        covered = int(row["covered"])
+        correct_base = int(row["correct_base"])
+
+        correct_adj = min(correct_base + correct_offset, covered)
+
+        incorrect_covered = max(covered - correct_adj, 0)
+
+        # error_offset is additional direct adjustment.
+        # Negative reduces errors; positive increases errors.
+        incorrect_covered = max(incorrect_covered + error_offset, 0)
+
+        total_errors = (
+            incorrect_covered
+            + int(row["missing_pred"])
+            + int(row["explicit_low_conf"])
+        )
+
+        adjusted_correct.append(correct_adj)
+        adjusted_incorrect_covered.append(incorrect_covered)
+        adjusted_total_errors.append(total_errors)
+
+    out["correct_adjusted_for_diagnostics"] = adjusted_correct
+    out["incorrect_covered_adjusted"] = adjusted_incorrect_covered
+    out["total_errors_adjusted"] = adjusted_total_errors
+
+    return out
+
+
+def add_bar_labels(ax, fmt="%.2f", fontsize=8):
+    for container in ax.containers:
+        ax.bar_label(container, fmt=fmt, fontsize=fontsize, padding=2)
+
+
+# =========================================================
+# 1. ERROR COMPOSITION STACKED BAR
+# =========================================================
+
+def plot_error_composition(summary_df: pd.DataFrame, threshold: int = 80):
+    """
+    Stacked bar showing:
+      - correct covered predictions
+      - incorrect covered predictions
+      - explicit low confidence
+      - missing predictions
+
+    This explains whether failures come from wrong values, low confidence, or missing fields.
+    """
+    df = summary_df.copy()
+    df = df[
+        (df["threshold"] == threshold)
+        & (df["doc_type"] != "OVERALL")
+    ].copy()
+
+    if df.empty:
+        print("No rows for error composition plot.")
+        return
+
+    df = apply_error_offsets_to_doc_summary(df)
+
+    plot_df = df.set_index("doc_type")[
+        [
+            "correct_adjusted_for_diagnostics",
+            "incorrect_covered_adjusted",
+            "explicit_low_conf",
+            "missing_pred",
+        ]
+    ]
+
+    plot_df = plot_df.apply(pd.to_numeric, errors="coerce").fillna(0)
+
+    ax = plot_df.plot(
+        kind="bar",
+        stacked=True,
+        figsize=(12, 6),
+    )
+
+    ax.set_title(f"Error Composition by Document Type at Threshold {threshold}")
+    ax.set_xlabel("Document Type")
+    ax.set_ylabel("Leaf Node Count")
+    ax.legend(
+        [
+            "Correct Covered",
+            "Incorrect Covered",
+            "Explicit Low Confidence",
+            "Missing Prediction",
+        ],
+        bbox_to_anchor=(1.02, 1),
+        loc="upper left",
+    )
+
+    plt.tight_layout()
+    out = DIAGNOSTIC_OUTPUT_DIR / f"error_composition_t{threshold}.png"
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f"Saved {out}")
+
+
+def plot_error_composition_percent(summary_df: pd.DataFrame, threshold: int = 80):
+    """
+    Same as error composition, but normalized to 100%.
+    """
+    df = summary_df.copy()
+    df = (
+        df[
+            (df["threshold"] == threshold)
+            & (df["doc_type"] != "OVERALL")
+        ]
+        .copy()
+    )
+
+    if df.empty:
+        print("No rows for percent error composition plot.")
+        return
+
+    df = apply_error_offsets_to_doc_summary(df)
+
+    plot_df = df.set_index("doc_type")[
+        [
+            "correct_adjusted_for_diagnostics",
+            "incorrect_covered_adjusted",
+            "explicit_low_conf",
+            "missing_pred",
+        ]
+    ]
+
+    plot_df = plot_df.apply(pd.to_numeric, errors="coerce").fillna(0)
+
+    row_sums = plot_df.sum(axis=1).replace(0, np.nan)
+    plot_df_pct = plot_df.div(row_sums, axis=0)
+
+    ax = plot_df_pct.plot(
+        kind="bar",
+        stacked=True,
+        figsize=(12, 6),
+    )
+
+    ax.set_title(f"Error Composition Share by Document Type at Threshold {threshold}")
+    ax.set_xlabel("Document Type")
+    ax.set_ylabel("Share")
+    ax.set_ylim(0, 1)
+    ax.legend(
+        [
+            "Correct Covered",
+            "Incorrect Covered",
+            "Explicit Low Confidence",
+            "Missing Prediction",
+        ],
+        bbox_to_anchor=(1.02, 1),
+        loc="upper left",
+    )
+
+    plt.tight_layout()
+    out = DIAGNOSTIC_OUTPUT_DIR / f"error_composition_percent_t{threshold}.png"
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f"Saved {out}")
+
+
+# =========================================================
+# 2. CONFIDENCE BUCKET VS OBSERVED ACCURACY
+# =========================================================
+
+def extract_field_level_records_from_file_df(file_df: pd.DataFrame, threshold: int = 80) -> pd.DataFrame:
+    """
+    Converts the wide per-file output into long field-level records.
+
+    Looks for columns ending in:
+      _gt
+      _pred
+      _confidence
+      _status
+      _covered
+      _match
+
+    Returns one row per file-field-threshold.
+    """
+    df = file_df[file_df["threshold"] == threshold].copy()
+    df = df[df["status"] == "OK"].copy()
+
+    field_names = sorted({
+        c[:-3] for c in df.columns if c.endswith("_gt")
+    })
+
+    rows = []
+
+    for _, row in df.iterrows():
+        doc_type = row["doc_type"]
+        file_name = row["file"]
+
+        for field in field_names:
+            gt_col = f"{field}_gt"
+            pred_col = f"{field}_pred"
+            conf_col = f"{field}_confidence"
+            status_col = f"{field}_status"
+            covered_col = f"{field}_covered"
+            match_col = f"{field}_match"
+
+            if gt_col not in df.columns and pred_col not in df.columns:
+                continue
+
+            gt_val = row.get(gt_col, None)
+            pred_val = row.get(pred_col, None)
+            confidence = row.get(conf_col, None)
+            status = row.get(status_col, None)
+            covered = row.get(covered_col, None)
+            match = row.get(match_col, None)
+
+            # Skip fields that are completely absent in this file row
+            if pd.isna(gt_val) and pd.isna(pred_val) and pd.isna(status):
+                continue
+
+            rows.append({
+                "doc_type": doc_type,
+                "file": file_name,
+                "field": field,
+                "gt_value": gt_val,
+                "pred_value": pred_val,
+                "confidence": confidence,
+                "status": status,
+                "covered": covered,
+                "match": match,
+            })
+
+    out = pd.DataFrame(rows)
+
+    if not out.empty:
+        out["confidence"] = pd.to_numeric(out["confidence"], errors="coerce")
+        out["covered"] = out["covered"].astype(str).str.lower().map(
+            {"true": True, "false": False}
+        ).fillna(out["covered"])
+        out["match"] = out["match"].astype(str).str.lower().map(
+            {"true": True, "false": False}
+        ).fillna(out["match"])
+
+    return out
+
+
+def confidence_bucket(x):
+    if pd.isna(x):
+        return "Missing"
+    if x < 50:
+        return "<50"
+    if x < 60:
+        return "50-60"
+    if x < 70:
+        return "60-70"
+    if x < 80:
+        return "70-80"
+    if x < 90:
+        return "80-90"
+    return "90-100"
+
+
+CONFIDENCE_BUCKET_ORDER = [
+    "<50",
+    "50-60",
+    "60-70",
+    "70-80",
+    "80-90",
+    "90-100",
+    "Missing",
+]
+
+
+def plot_confidence_bucket_accuracy(file_df: pd.DataFrame, threshold: int = 80):
+    """
+    Shows whether confidence is meaningful:
+      x-axis = confidence bucket
+      y-axis = observed accuracy among covered predictions
+
+    Missing confidence is shown separately because your rule treats it as covered.
+    """
+    long_df = extract_field_level_records_from_file_df(file_df, threshold=threshold)
+
+    if long_df.empty:
+        print("No field-level records for confidence bucket plot.")
+        return
+
+    # We only evaluate accuracy on covered predictions
+    covered_df = long_df[long_df["covered"] == True].copy()
+
+    if covered_df.empty:
+        print("No covered predictions for confidence bucket plot.")
+        return
+
+    covered_df["confidence_bucket"] = covered_df["confidence"].apply(confidence_bucket)
+
+    # Apply field-level manual offsets only in aggregate form
+    # Here we do not alter individual match values because offset does not identify exact rows.
+    bucket_summary = (
+        covered_df
+        .groupby("confidence_bucket", dropna=False)
+        .agg(
+            count=("match", "size"),
+            correct=("match", lambda x: pd.Series(x).fillna(False).astype(bool).sum()),
+        )
+        .reset_index()
+    )
+
+    bucket_summary["observed_accuracy"] = bucket_summary["correct"] / bucket_summary["count"]
+    bucket_summary["confidence_bucket"] = pd.Categorical(
+        bucket_summary["confidence_bucket"],
+        categories=CONFIDENCE_BUCKET_ORDER,
+        ordered=True,
+    )
+    bucket_summary = bucket_summary.sort_values("confidence_bucket")
+
+    ax = bucket_summary.plot(
+        x="confidence_bucket",
+        y="observed_accuracy",
+        kind="bar",
+        figsize=(10, 5),
+        legend=False,
+    )
+
+    add_bar_labels(ax, fmt="%.2f", fontsize=8)
+
+    ax.set_title(f"Observed Accuracy by Confidence Bucket at Threshold {threshold}")
+    ax.set_xlabel("Confidence Bucket")
+    ax.set_ylabel("Observed Accuracy")
+    ax.set_ylim(0, 1.10)
+
+    plt.tight_layout()
+    out = DIAGNOSTIC_OUTPUT_DIR / f"confidence_bucket_accuracy_t{threshold}.png"
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f"Saved {out}")
+
+    csv_out = DIAGNOSTIC_OUTPUT_DIR / f"confidence_bucket_accuracy_t{threshold}.csv"
+    bucket_summary.to_csv(csv_out, index=False)
+    print(f"Saved {csv_out}")
+
+
+def plot_confidence_bucket_accuracy_by_doc_type(file_df: pd.DataFrame, threshold: int = 80):
+    """
+    Same confidence bucket analysis split by document type.
+    """
+    long_df = extract_field_level_records_from_file_df(file_df, threshold=threshold)
+
+    if long_df.empty:
+        print("No field-level records for confidence bucket by doc type plot.")
+        return
+
+    covered_df = long_df[long_df["covered"] == True].copy()
+
+    if covered_df.empty:
+        print("No covered predictions for confidence bucket by doc type plot.")
+        return
+
+    covered_df["confidence_bucket"] = covered_df["confidence"].apply(confidence_bucket)
+
+    grouped = (
+        covered_df
+        .groupby(["confidence_bucket", "doc_type"], dropna=False)
+        .agg(
+            count=("match", "size"),
+            correct=("match", lambda x: pd.Series(x).fillna(False).astype(bool).sum()),
+        )
+        .reset_index()
+    )
+
+    grouped["observed_accuracy"] = grouped["correct"] / grouped["count"]
+    grouped["confidence_bucket"] = pd.Categorical(
+        grouped["confidence_bucket"],
+        categories=CONFIDENCE_BUCKET_ORDER,
+        ordered=True,
+    )
+
+    pivot = grouped.pivot(
+        index="confidence_bucket",
+        columns="doc_type",
+        values="observed_accuracy",
+    ).sort_index()
+
+    if pivot.dropna(how="all").empty:
+        print("No numeric data for confidence bucket by doc type plot.")
+        return
+
+    ax = pivot.plot(kind="bar", figsize=(12, 6))
+    ax.set_title(f"Observed Accuracy by Confidence Bucket and Doc Type at Threshold {threshold}")
+    ax.set_xlabel("Confidence Bucket")
+    ax.set_ylabel("Observed Accuracy")
+    ax.set_ylim(0, 1.10)
+    ax.legend(title="Doc Type", bbox_to_anchor=(1.02, 1), loc="upper left")
+
+    plt.tight_layout()
+    out = DIAGNOSTIC_OUTPUT_DIR / f"confidence_bucket_accuracy_by_doc_type_t{threshold}.png"
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f"Saved {out}")
+
+
+# =========================================================
+# 3. FILE-LEVEL DISTRIBUTION PLOTS
+# =========================================================
+
+def plot_file_level_boxplots(file_df: pd.DataFrame, threshold: int = 80):
+    """
+    Boxplots show whether aggregate performance is stable across files
+    or driven by outliers.
+    """
+    df = file_df.copy()
+    df = df[(df["threshold"] == threshold) & (df["status"] == "OK")].copy()
+
+    if df.empty:
+        print("No rows for file-level boxplots.")
+        return
+
+    for metric in ["coverage", "accuracy", "f1_balanced_score", "f2_coverage_weighted_score"]:
+        df[metric] = pd.to_numeric(df[metric], errors="coerce")
+
+        if df[metric].dropna().empty:
+            print(f"Skipping file-level boxplot for {metric}: no numeric data.")
+            continue
+
+        grouped = [
+            df.loc[df["doc_type"] == dt, metric].dropna().values
+            for dt in sorted(df["doc_type"].unique())
+        ]
+        labels = sorted(df["doc_type"].unique())
+
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.boxplot(grouped, labels=labels, showmeans=True)
+        ax.set_title(f"File-Level Distribution of {metric.replace('_', ' ').title()} at Threshold {threshold}")
+        ax.set_xlabel("Document Type")
+        ax.set_ylabel(metric.replace("_", " ").title())
+        ax.set_ylim(0, 1.05)
+
+        plt.tight_layout()
+        out = DIAGNOSTIC_OUTPUT_DIR / f"file_level_boxplot_{metric}_t{threshold}.png"
+        plt.savefig(out, dpi=150)
+        plt.close()
+        print(f"Saved {out}")
+
+
+def plot_file_level_histograms(file_df: pd.DataFrame, threshold: int = 80):
+    """
+    Histograms of file-level coverage and accuracy.
+    """
+    df = file_df.copy()
+    df = df[(df["threshold"] == threshold) & (df["status"] == "OK")].copy()
+
+    if df.empty:
+        print("No rows for file-level histograms.")
+        return
+
+    for metric in ["coverage", "accuracy"]:
+        df[metric] = pd.to_numeric(df[metric], errors="coerce")
+        values = df[metric].dropna()
+
+        if values.empty:
+            print(f"Skipping histogram for {metric}: no numeric data.")
+            continue
+
+        fig, ax = plt.subplots(figsize=(9, 5))
+        ax.hist(values, bins=10)
+        ax.set_title(f"File-Level {metric.title()} Distribution at Threshold {threshold}")
+        ax.set_xlabel(metric.title())
+        ax.set_ylabel("File Count")
+        ax.set_xlim(0, 1)
+
+        plt.tight_layout()
+        out = DIAGNOSTIC_OUTPUT_DIR / f"file_level_histogram_{metric}_t{threshold}.png"
+        plt.savefig(out, dpi=150)
+        plt.close()
+        print(f"Saved {out}")
+
+
+# =========================================================
+# 4. TOP ERROR-CONTRIBUTING FIELDS / PARETO
+# =========================================================
+
+def build_field_error_table(file_df: pd.DataFrame, threshold: int = 80) -> pd.DataFrame:
+    """
+    Builds field-level error counts from the wide per-file table.
+
+    Error definition:
+      - covered but not matched
+      - explicit low confidence
+      - missing prediction
+
+    Manual offsets can reduce errors for specific fields.
+    """
+    long_df = extract_field_level_records_from_file_df(file_df, threshold=threshold)
+
+    if long_df.empty:
+        return pd.DataFrame()
+
+    rows = []
+
+    for (doc_type, field), g in long_df.groupby(["doc_type", "field"], dropna=False):
+        total = len(g)
+
+        covered = (g["covered"] == True).sum()
+        correct = ((g["covered"] == True) & (g["match"] == True)).sum()
+
+        incorrect_covered = ((g["covered"] == True) & (g["match"] != True)).sum()
+        explicit_low_conf = (g["status"] == "explicit_low_conf").sum()
+        missing_pred = (g["status"] == "missing_pred").sum()
+
+        raw_errors = int(incorrect_covered + explicit_low_conf + missing_pred)
+
+        offsets = get_field_offsets(doc_type, field)
+        correct_offset = int(offsets.get("correct_offset", 0))
+        error_offset = int(offsets.get("error_offset", 0))
+
+        # Correct offset mainly reduces incorrect covered count.
+        adjusted_incorrect_covered = max(int(incorrect_covered) - correct_offset, 0)
+
+        adjusted_errors = (
+            adjusted_incorrect_covered
+            + int(explicit_low_conf)
+            + int(missing_pred)
+            + error_offset
+        )
+        adjusted_errors = max(adjusted_errors, 0)
+
+        coverage = covered / total if total else None
+        accuracy = correct / covered if covered else None
+
+        rows.append({
+            "doc_type": doc_type,
+            "field": field,
+            "total": total,
+            "covered": int(covered),
+            "correct": int(correct),
+            "coverage": coverage,
+            "accuracy": accuracy,
+
+            "incorrect_covered_raw": int(incorrect_covered),
+            "explicit_low_conf": int(explicit_low_conf),
+            "missing_pred": int(missing_pred),
+            "raw_errors": raw_errors,
+
+            "manual_correct_offset": correct_offset,
+            "manual_error_offset": error_offset,
+            "adjusted_errors": adjusted_errors,
+        })
+
+    out = pd.DataFrame(rows)
+
+    if not out.empty:
+        out = out.sort_values("adjusted_errors", ascending=False).reset_index(drop=True)
+        total_errors = out["adjusted_errors"].sum()
+        out["error_share"] = out["adjusted_errors"] / total_errors if total_errors else 0
+        out["cumulative_error_share"] = out["error_share"].cumsum()
+
+    return out
+
+
+def plot_top_error_fields(file_df: pd.DataFrame, threshold: int = 80, top_n: int = 25):
+    field_errors = build_field_error_table(file_df, threshold=threshold)
+
+    if field_errors.empty:
+        print("No field error data.")
+        return
+
+    csv_out = DIAGNOSTIC_OUTPUT_DIR / f"field_error_table_t{threshold}.csv"
+    field_errors.to_csv(csv_out, index=False)
+    print(f"Saved {csv_out}")
+
+    top = field_errors.head(top_n).copy()
+    top["display"] = top["doc_type"] + " | " + top["field"].astype(str)
+
+    if top["adjusted_errors"].sum() == 0:
+        print("No adjusted field errors to plot.")
+        return
+
+    ax = top.sort_values("adjusted_errors").plot(
+        x="display",
+        y="adjusted_errors",
+        kind="barh",
+        figsize=(12, max(6, top_n * 0.28)),
+        legend=False,
+    )
+
+    ax.set_title(f"Top {top_n} Error-Contributing Fields at Threshold {threshold}")
+    ax.set_xlabel("Adjusted Error Count")
+    ax.set_ylabel("Doc Type | Field")
+
+    plt.tight_layout()
+    out = DIAGNOSTIC_OUTPUT_DIR / f"top_error_fields_t{threshold}.png"
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f"Saved {out}")
+
+
+def plot_pareto_error_fields(file_df: pd.DataFrame, threshold: int = 80, top_n: int = 30):
+    field_errors = build_field_error_table(file_df, threshold=threshold)
+
+    if field_errors.empty:
+        print("No field error data for Pareto plot.")
+        return
+
+    field_errors = field_errors[field_errors["adjusted_errors"] > 0].copy()
+
+    if field_errors.empty:
+        print("No adjusted errors for Pareto plot.")
+        return
+
+    top = field_errors.head(top_n).copy()
+    top["display"] = top["doc_type"] + " | " + top["field"].astype(str)
+
+    fig, ax1 = plt.subplots(figsize=(14, 6))
+
+    ax1.bar(top["display"], top["adjusted_errors"])
+    ax1.set_xlabel("Field")
+    ax1.set_ylabel("Adjusted Error Count")
+    ax1.tick_params(axis="x", rotation=75)
+
+    ax2 = ax1.twinx()
+    ax2.plot(top["display"], top["cumulative_error_share"], marker="o")
+    ax2.set_ylabel("Cumulative Error Share")
+    ax2.set_ylim(0, 1.05)
+
+    ax1.set_title(f"Pareto Chart of Field Errors at Threshold {threshold}")
+
+    plt.tight_layout()
+    out = DIAGNOSTIC_OUTPUT_DIR / f"pareto_field_errors_t{threshold}.png"
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f"Saved {out}")
+
+
+# =========================================================
+# MAIN RUNNER
+# =========================================================
+
+def run_performance_diagnostic_plots(threshold: int = DEFAULT_THRESHOLD_FOR_DIAGNOSTICS):
+    summary_df, file_df, field_df = load_performance_outputs()
+
+    plot_error_composition(summary_df, threshold=threshold)
+    plot_error_composition_percent(summary_df, threshold=threshold)
+
+    plot_confidence_bucket_accuracy(file_df, threshold=threshold)
+    plot_confidence_bucket_accuracy_by_doc_type(file_df, threshold=threshold)
+
+    plot_file_level_boxplots(file_df, threshold=threshold)
+    plot_file_level_histograms(file_df, threshold=threshold)
+
+    plot_top_error_fields(file_df, threshold=threshold, top_n=25)
+    plot_pareto_error_fields(file_df, threshold=threshold, top_n=30)
+
+    print("\nSaved diagnostic outputs to:")
+    print(DIAGNOSTIC_OUTPUT_DIR.resolve())
+
+
+if __name__ == "__main__":
+    run_performance_diagnostic_plots(threshold=DEFAULT_THRESHOLD_FOR_DIAGNOSTICS)
