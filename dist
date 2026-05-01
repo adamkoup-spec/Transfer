@@ -1,106 +1,247 @@
-from PIL import Image, ImageFilter, ImageEnhance
+import cv2
 import numpy as np
+import random
 from pathlib import Path
-import io
 
+# ============================================================
+# CONFIG
+# ============================================================
 
-DISTORTION_LEVELS = {
+INPUT_PNG = r"H:\sample_docs\sample.png"
+OUTPUT_DIR = r"H:\sample_docs\noisy_samples"
+
+RANDOM_SEED = 42
+random.seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+
+SEVERITY_CONFIG = {
     "light": {
+        "rotation_limit": 1.5,
+        "perspective_shift": 0.015,
+        "blur_kernel_max": 3,
         "noise_std": 5,
-        "blur_radius": 0.3,
-        "rotation": 0.3,
-        "contrast": 0.98,
-        "sharpness": 0.95,
-        "jpeg_quality": 92,
-        "resize_scale": 0.98,
+        "brightness_alpha": (0.97, 1.05),
+        "brightness_beta": (-8, 8),
+        "jpeg_quality": (75, 95),
+        "downscale_factor": (0.85, 1.0),
+        "shadow_strength": (0.05, 0.15),
     },
     "medium": {
+        "rotation_limit": 3.5,
+        "perspective_shift": 0.035,
+        "blur_kernel_max": 5,
         "noise_std": 10,
-        "blur_radius": 0.7,
-        "rotation": 0.8,
-        "contrast": 0.92,
-        "sharpness": 0.85,
-        "jpeg_quality": 80,
-        "resize_scale": 0.93,
+        "brightness_alpha": (0.90, 1.12),
+        "brightness_beta": (-20, 20),
+        "jpeg_quality": (45, 85),
+        "downscale_factor": (0.65, 0.95),
+        "shadow_strength": (0.10, 0.28),
     },
     "heavy": {
-        "noise_std": 16,
-        "blur_radius": 1.0,
-        "rotation": 1.2,
-        "contrast": 0.85,
-        "sharpness": 0.75,
-        "jpeg_quality": 68,
-        "resize_scale": 0.88,
+        "rotation_limit": 6,
+        "perspective_shift": 0.065,
+        "blur_kernel_max": 7,
+        "noise_std": 18,
+        "brightness_alpha": (0.80, 1.20),
+        "brightness_beta": (-35, 35),
+        "jpeg_quality": (25, 70),
+        "downscale_factor": (0.45, 0.85),
+        "shadow_strength": (0.18, 0.40),
     },
 }
 
 
-def apply_distortion(img, level="light"):
-    if level not in DISTORTION_LEVELS:
-        raise ValueError("level must be one of: light, medium, heavy")
+# ============================================================
+# HELPERS
+# ============================================================
 
-    p = DISTORTION_LEVELS[level]
+def ensure_odd(k):
+    return k if k % 2 == 1 else k + 1
 
-    img = img.convert("RGB")
 
-    # Slight rotation
-    img = img.rotate(
-        p["rotation"],
-        resample=Image.BICUBIC,
-        expand=True,
-        fillcolor="white"
+def apply_rotation(img, cfg):
+    h, w = img.shape[:2]
+    angle = random.uniform(-cfg["rotation_limit"], cfg["rotation_limit"])
+
+    M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+
+    return cv2.warpAffine(
+        img,
+        M,
+        (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(255, 255, 255),
     )
 
-    # Mild resolution degradation
-    w, h = img.size
-    small = img.resize(
-        (int(w * p["resize_scale"]), int(h * p["resize_scale"])),
-        Image.BILINEAR
+
+def apply_perspective(img, cfg):
+    h, w = img.shape[:2]
+    shift = cfg["perspective_shift"] * min(h, w)
+
+    src = np.float32([
+        [0, 0],
+        [w - 1, 0],
+        [0, h - 1],
+        [w - 1, h - 1],
+    ])
+
+    dst = np.float32([
+        [random.uniform(0, shift), random.uniform(0, shift)],
+        [w - 1 - random.uniform(0, shift), random.uniform(0, shift)],
+        [random.uniform(0, shift), h - 1 - random.uniform(0, shift)],
+        [w - 1 - random.uniform(0, shift), h - 1 - random.uniform(0, shift)],
+    ])
+
+    M = cv2.getPerspectiveTransform(src, dst)
+
+    return cv2.warpPerspective(
+        img,
+        M,
+        (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(255, 255, 255),
     )
-    img = small.resize((w, h), Image.BILINEAR)
-
-    # Blur
-    img = img.filter(ImageFilter.GaussianBlur(radius=p["blur_radius"]))
-
-    # Contrast and sharpness
-    img = ImageEnhance.Contrast(img).enhance(p["contrast"])
-    img = ImageEnhance.Sharpness(img).enhance(p["sharpness"])
-
-    # JPEG compression artifact simulation
-    buffer = io.BytesIO()
-    img.save(buffer, format="JPEG", quality=p["jpeg_quality"])
-    buffer.seek(0)
-    img = Image.open(buffer).convert("RGB")
-
-    # Gaussian noise
-    arr = np.array(img).astype(np.int16)
-    noise = np.random.normal(0, p["noise_std"], arr.shape).astype(np.int16)
-    arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
-
-    return Image.fromarray(arr)
 
 
-def generate_noise_versions(input_png, output_dir=None):
-    input_png = Path(input_png)
+def apply_page_warp(img, strength):
+    h, w = img.shape[:2]
 
-    if output_dir is None:
-        output_dir = input_png.parent / "distorted"
-    else:
-        output_dir = Path(output_dir)
+    map_x, map_y = np.meshgrid(
+        np.arange(w, dtype=np.float32),
+        np.arange(h, dtype=np.float32),
+    )
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    phase = random.uniform(0, 2 * np.pi)
+    freq = random.uniform(1.0, 2.3) / h
 
-    original = Image.open(input_png).convert("RGB")
+    shift_x = strength * np.sin(2 * np.pi * freq * map_y + phase)
+    map_x = np.clip(map_x + shift_x, 0, w - 1)
 
-    for level in ["light", "medium", "heavy"]:
-        distorted = apply_distortion(original.copy(), level=level)
-        output_path = output_dir / f"{input_png.stem}_{level}.png"
-        distorted.save(output_path)
-        print(f"Saved: {output_path}")
+    return cv2.remap(
+        img,
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(255, 255, 255),
+    )
 
 
-# Example
-generate_noise_versions(
-    input_png=r"H:\sample.png",
-    output_dir=r"H:\distorted_outputs"
-)
+def apply_blur(img, cfg):
+    k = random.randint(1, cfg["blur_kernel_max"])
+    k = ensure_odd(k)
+
+    if k <= 1:
+        return img
+
+    return cv2.GaussianBlur(img, (k, k), 0)
+
+
+def apply_noise(img, cfg):
+    noise = np.random.normal(0, cfg["noise_std"], img.shape).astype(np.float32)
+    out = img.astype(np.float32) + noise
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def apply_brightness_contrast(img, cfg):
+    alpha = random.uniform(*cfg["brightness_alpha"])
+    beta = random.uniform(*cfg["brightness_beta"])
+
+    out = img.astype(np.float32) * alpha + beta
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def apply_shadow(img, cfg):
+    h, w = img.shape[:2]
+    shadow = np.ones((h, w), dtype=np.float32)
+
+    strength = random.uniform(*cfg["shadow_strength"])
+
+    x1 = random.randint(0, w - 1)
+    x2 = random.randint(0, w - 1)
+    x_left, x_right = min(x1, x2), max(x1, x2)
+
+    shadow[:, x_left:x_right] = 1.0 - strength
+    shadow = cv2.GaussianBlur(shadow, (101, 101), 0)
+
+    out = img.astype(np.float32)
+    for c in range(3):
+        out[:, :, c] *= shadow
+
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def apply_downscale_upscale(img, cfg):
+    h, w = img.shape[:2]
+    factor = random.uniform(*cfg["downscale_factor"])
+
+    small_w = max(1, int(w * factor))
+    small_h = max(1, int(h * factor))
+
+    small = cv2.resize(img, (small_w, small_h), interpolation=cv2.INTER_AREA)
+    restored = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    return restored
+
+
+def apply_jpeg_compression(img, cfg):
+    quality = random.randint(*cfg["jpeg_quality"])
+
+    success, encoded = cv2.imencode(
+        ".jpg",
+        img,
+        [int(cv2.IMWRITE_JPEG_QUALITY), quality],
+    )
+
+    if not success:
+        return img
+
+    return cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+
+
+def apply_ocr_noise(img, severity):
+    cfg = SEVERITY_CONFIG[severity]
+    out = img.copy()
+
+    out = apply_rotation(out, cfg)
+    out = apply_perspective(out, cfg)
+
+    warp_strength = {
+        "light": 2,
+        "medium": 5,
+        "heavy": 10,
+    }[severity]
+    out = apply_page_warp(out, warp_strength)
+
+    out = apply_downscale_upscale(out, cfg)
+    out = apply_blur(out, cfg)
+    out = apply_brightness_contrast(out, cfg)
+    out = apply_shadow(out, cfg)
+    out = apply_noise(out, cfg)
+    out = apply_jpeg_compression(out, cfg)
+
+    return out
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+input_path = Path(INPUT_PNG)
+output_dir = Path(OUTPUT_DIR)
+output_dir.mkdir(parents=True, exist_ok=True)
+
+img = cv2.imread(str(input_path), cv2.IMREAD_COLOR)
+
+if img is None:
+    raise ValueError(f"Could not read image: {input_path}")
+
+for severity in ["light", "medium", "heavy"]:
+    noisy = apply_ocr_noise(img, severity)
+
+    output_path = output_dir / f"{input_path.stem}_{severity}_noise.png"
+    cv2.imwrite(str(output_path), noisy)
+
+    print(f"Saved: {output_path}")
