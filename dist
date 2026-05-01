@@ -16,59 +16,69 @@ np.random.seed(RANDOM_SEED)
 
 SEVERITY_CONFIG = {
     "light": {
-        "rotation_limit": 1.5,
-        "perspective_shift": 0.015,
+        "rotation_limit": 2,
+        "perspective_shift": 0.02,
         "blur_kernel_max": 3,
-        "noise_std": 5,
-        "brightness_alpha": (0.97, 1.05),
-        "brightness_beta": (-8, 8),
-        "jpeg_quality": (75, 95),
+        "motion_blur_max": 5,
+        "noise_std": 6,
+        "brightness_alpha": (0.95, 1.05),
+        "brightness_beta": (-10, 10),
+        "jpeg_quality": (70, 95),
         "downscale_factor": (0.85, 1.0),
-        "shadow_strength": (0.05, 0.15),
+        "shadow_strength": (0.08, 0.18),
+        "warp_strength": 3,
+        "salt_pepper_amount": 0.0008,
     },
     "medium": {
-        "rotation_limit": 3.5,
-        "perspective_shift": 0.035,
+        "rotation_limit": 5,
+        "perspective_shift": 0.05,
         "blur_kernel_max": 5,
-        "noise_std": 10,
-        "brightness_alpha": (0.90, 1.12),
-        "brightness_beta": (-20, 20),
-        "jpeg_quality": (45, 85),
-        "downscale_factor": (0.65, 0.95),
-        "shadow_strength": (0.10, 0.28),
+        "motion_blur_max": 9,
+        "noise_std": 12,
+        "brightness_alpha": (0.85, 1.15),
+        "brightness_beta": (-25, 25),
+        "jpeg_quality": (40, 85),
+        "downscale_factor": (0.65, 1.0),
+        "shadow_strength": (0.12, 0.30),
+        "warp_strength": 7,
+        "salt_pepper_amount": 0.0015,
     },
     "heavy": {
-        "rotation_limit": 6,
-        "perspective_shift": 0.065,
+        "rotation_limit": 8,
+        "perspective_shift": 0.08,
         "blur_kernel_max": 7,
-        "noise_std": 18,
-        "brightness_alpha": (0.80, 1.20),
-        "brightness_beta": (-35, 35),
-        "jpeg_quality": (25, 70),
-        "downscale_factor": (0.45, 0.85),
+        "motion_blur_max": 15,
+        "noise_std": 20,
+        "brightness_alpha": (0.75, 1.20),
+        "brightness_beta": (-40, 40),
+        "jpeg_quality": (20, 70),
+        "downscale_factor": (0.45, 0.9),
         "shadow_strength": (0.18, 0.40),
+        "warp_strength": 12,
+        "salt_pepper_amount": 0.0025,
     },
 }
 
 
-# ============================================================
-# HELPERS
-# ============================================================
-
-def ensure_odd(k):
-    return k if k % 2 == 1 else k + 1
+def ensure_odd(x):
+    return x if x % 2 == 1 else x + 1
 
 
 def apply_rotation(img, cfg):
     h, w = img.shape[:2]
     angle = random.uniform(-cfg["rotation_limit"], cfg["rotation_limit"])
-
     M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
 
+    cos = abs(M[0, 0])
+    sin = abs(M[0, 1])
+    new_w = int((h * sin) + (w * cos))
+    new_h = int((h * cos) + (w * sin))
+
+    M[0, 2] += (new_w / 2) - w / 2
+    M[1, 2] += (new_h / 2) - h / 2
+
     return cv2.warpAffine(
-        img,
-        M,
-        (w, h),
+        img, M, (new_w, new_h),
         flags=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=(255, 255, 255),
@@ -96,17 +106,16 @@ def apply_perspective(img, cfg):
     M = cv2.getPerspectiveTransform(src, dst)
 
     return cv2.warpPerspective(
-        img,
-        M,
-        (w, h),
+        img, M, (w, h),
         flags=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=(255, 255, 255),
     )
 
 
-def apply_page_warp(img, strength):
+def apply_page_warp(img, cfg):
     h, w = img.shape[:2]
+    strength = cfg["warp_strength"]
 
     map_x, map_y = np.meshgrid(
         np.arange(w, dtype=np.float32),
@@ -114,41 +123,72 @@ def apply_page_warp(img, strength):
     )
 
     phase = random.uniform(0, 2 * np.pi)
-    freq = random.uniform(1.0, 2.3) / h
+    freq = random.uniform(1.0, 2.5) / h
 
     shift_x = strength * np.sin(2 * np.pi * freq * map_y + phase)
     map_x = np.clip(map_x + shift_x, 0, w - 1)
 
     return cv2.remap(
-        img,
-        map_x,
-        map_y,
+        img, map_x, map_y,
         interpolation=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=(255, 255, 255),
     )
 
 
-def apply_blur(img, cfg):
+def apply_gaussian_blur(img, cfg):
     k = random.randint(1, cfg["blur_kernel_max"])
     k = ensure_odd(k)
-
     if k <= 1:
         return img
-
     return cv2.GaussianBlur(img, (k, k), 0)
 
 
-def apply_noise(img, cfg):
+def apply_motion_blur(img, cfg):
+    k = random.randint(3, cfg["motion_blur_max"])
+    k = ensure_odd(k)
+
+    kernel = np.zeros((k, k), dtype=np.float32)
+    mode = random.choice(["horizontal", "vertical", "diag1", "diag2"])
+
+    if mode == "horizontal":
+        kernel[k // 2, :] = 1.0
+    elif mode == "vertical":
+        kernel[:, k // 2] = 1.0
+    elif mode == "diag1":
+        np.fill_diagonal(kernel, 1.0)
+    else:
+        np.fill_diagonal(np.fliplr(kernel), 1.0)
+
+    kernel /= kernel.sum()
+    return cv2.filter2D(img, -1, kernel)
+
+
+def apply_gaussian_noise(img, cfg):
     noise = np.random.normal(0, cfg["noise_std"], img.shape).astype(np.float32)
     out = img.astype(np.float32) + noise
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
+def apply_salt_pepper_noise(img, cfg):
+    out = img.copy()
+    h, w = img.shape[:2]
+    n = int(cfg["salt_pepper_amount"] * h * w)
+
+    ys = np.random.randint(0, h, n)
+    xs = np.random.randint(0, w, n)
+    out[ys, xs] = 255
+
+    ys = np.random.randint(0, h, n)
+    xs = np.random.randint(0, w, n)
+    out[ys, xs] = 0
+
+    return out
+
+
 def apply_brightness_contrast(img, cfg):
     alpha = random.uniform(*cfg["brightness_alpha"])
     beta = random.uniform(*cfg["brightness_beta"])
-
     out = img.astype(np.float32) * alpha + beta
     return np.clip(out, 0, 255).astype(np.uint8)
 
@@ -157,13 +197,33 @@ def apply_shadow(img, cfg):
     h, w = img.shape[:2]
     shadow = np.ones((h, w), dtype=np.float32)
 
+    orientation = random.choice(["vertical", "horizontal", "diagonal"])
     strength = random.uniform(*cfg["shadow_strength"])
 
-    x1 = random.randint(0, w - 1)
-    x2 = random.randint(0, w - 1)
-    x_left, x_right = min(x1, x2), max(x1, x2)
+    if orientation == "vertical":
+        x1 = random.randint(0, w - 1)
+        x2 = random.randint(0, w - 1)
+        x_left, x_right = min(x1, x2), max(x1, x2)
+        shadow[:, x_left:x_right] = 1.0 - strength
 
-    shadow[:, x_left:x_right] = 1.0 - strength
+    elif orientation == "horizontal":
+        y1 = random.randint(0, h - 1)
+        y2 = random.randint(0, h - 1)
+        y_top, y_bottom = min(y1, y2), max(y1, y2)
+        shadow[y_top:y_bottom, :] = 1.0 - strength
+
+    else:
+        pts = np.array([
+            [random.randint(0, max(1, w // 3)), 0],
+            [random.randint(max(1, w // 3), w - 1), 0],
+            [random.randint(0, w - 1), h - 1],
+            [0, h - 1],
+        ], dtype=np.int32)
+
+        mask = np.ones((h, w), dtype=np.float32)
+        cv2.fillPoly(mask, [pts], 1.0 - strength)
+        shadow = np.minimum(shadow, mask)
+
     shadow = cv2.GaussianBlur(shadow, (101, 101), 0)
 
     out = img.astype(np.float32)
@@ -176,6 +236,9 @@ def apply_shadow(img, cfg):
 def apply_downscale_upscale(img, cfg):
     h, w = img.shape[:2]
     factor = random.uniform(*cfg["downscale_factor"])
+
+    if factor >= 0.98:
+        return img
 
     small_w = max(1, int(w * factor))
     small_h = max(1, int(h * factor))
@@ -205,43 +268,59 @@ def apply_ocr_noise(img, severity):
     cfg = SEVERITY_CONFIG[severity]
     out = img.copy()
 
-    out = apply_rotation(out, cfg)
-    out = apply_perspective(out, cfg)
+    # Same probabilities as batch version
+    if random.random() < 0.85:
+        out = apply_rotation(out, cfg)
 
-    warp_strength = {
-        "light": 2,
-        "medium": 5,
-        "heavy": 10,
-    }[severity]
-    out = apply_page_warp(out, warp_strength)
+    if random.random() < 0.75:
+        out = apply_perspective(out, cfg)
 
-    out = apply_downscale_upscale(out, cfg)
-    out = apply_blur(out, cfg)
-    out = apply_brightness_contrast(out, cfg)
-    out = apply_shadow(out, cfg)
-    out = apply_noise(out, cfg)
-    out = apply_jpeg_compression(out, cfg)
+    if random.random() < 0.60:
+        out = apply_page_warp(out, cfg)
+
+    if random.random() < 0.70:
+        out = apply_downscale_upscale(out, cfg)
+
+    if random.random() < 0.50:
+        out = apply_gaussian_blur(out, cfg)
+
+    if random.random() < 0.35:
+        out = apply_motion_blur(out, cfg)
+
+    if random.random() < 0.80:
+        out = apply_brightness_contrast(out, cfg)
+
+    if random.random() < 0.50:
+        out = apply_shadow(out, cfg)
+
+    if random.random() < 0.60:
+        out = apply_gaussian_noise(out, cfg)
+
+    if random.random() < 0.30:
+        out = apply_salt_pepper_noise(out, cfg)
+
+    if random.random() < 0.75:
+        out = apply_jpeg_compression(out, cfg)
 
     return out
 
 
-# ============================================================
-# MAIN
-# ============================================================
+def main():
+    input_path = Path(INPUT_PNG)
+    output_dir = Path(OUTPUT_DIR)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-input_path = Path(INPUT_PNG)
-output_dir = Path(OUTPUT_DIR)
-output_dir.mkdir(parents=True, exist_ok=True)
+    img = cv2.imread(str(input_path), cv2.IMREAD_COLOR)
 
-img = cv2.imread(str(input_path), cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError(f"Could not read image: {input_path}")
 
-if img is None:
-    raise ValueError(f"Could not read image: {input_path}")
+    for severity in ["light", "medium", "heavy"]:
+        noisy = apply_ocr_noise(img, severity)
+        output_path = output_dir / f"{input_path.stem}_{severity}_noise.png"
+        cv2.imwrite(str(output_path), noisy)
+        print(f"Saved: {output_path}")
 
-for severity in ["light", "medium", "heavy"]:
-    noisy = apply_ocr_noise(img, severity)
 
-    output_path = output_dir / f"{input_path.stem}_{severity}_noise.png"
-    cv2.imwrite(str(output_path), noisy)
-
-    print(f"Saved: {output_path}")
+if __name__ == "__main__":
+    main()
