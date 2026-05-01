@@ -1,71 +1,114 @@
 from PIL import Image, ImageFilter, ImageEnhance
 import numpy as np
-import random
 from pathlib import Path
+import io
 
 
-def add_noise(img, noise_std=25):
-    """Add random Gaussian noise."""
-    arr = np.array(img).astype(np.int16)
-    noise = np.random.normal(0, noise_std, arr.shape).astype(np.int16)
-    noisy = np.clip(arr + noise, 0, 255).astype(np.uint8)
-    return Image.fromarray(noisy)
+def apply_distortion(img, level="light"):
 
+    if level == "light":
+        noise_std = 6
+        blur_radius = 0.5
+        rotation = 0.5
+        contrast = 0.97
+        sharpness = 0.9
+        jpeg_quality = 85
+        resize_scale = 0.97
 
-def add_blur(img, radius=1.5):
-    """Apply mild blur."""
-    return img.filter(ImageFilter.GaussianBlur(radius=radius))
+    elif level == "medium":
+        noise_std = 14
+        blur_radius = 1.2
+        rotation = 1.5
+        contrast = 0.85
+        sharpness = 0.7
+        jpeg_quality = 55
+        resize_scale = 0.85
 
+    elif level == "heavy":
+        noise_std = 28
+        blur_radius = 2.2
+        rotation = 3
+        contrast = 0.7
+        sharpness = 0.45
+        jpeg_quality = 28
+        resize_scale = 0.65
 
-def add_skew_rotation(img, angle=2.5):
-    """Apply slight rotation/skew-like distortion."""
-    return img.rotate(
-        angle,
+    else:
+        raise ValueError("Choose light / medium / heavy")
+
+    # Slight skew/rotation
+    img = img.rotate(
+        rotation,
         resample=Image.BICUBIC,
         expand=True,
         fillcolor="white"
     )
 
+    # Downsample / upsample degradation
+    w, h = img.size
+    small = img.resize(
+        (int(w * resize_scale), int(h * resize_scale)),
+        Image.BILINEAR
+    )
 
-def add_low_quality_scan_effect(img):
-    """Reduce contrast/sharpness to imitate low-quality scan."""
-    img = ImageEnhance.Contrast(img).enhance(0.75)
-    img = ImageEnhance.Sharpness(img).enhance(0.65)
-    img = ImageEnhance.Brightness(img).enhance(0.95)
-    return img
+    img = small.resize((w, h), Image.BILINEAR)
+
+    # Blur
+    img = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+    # Contrast / sharpness degradation
+    img = ImageEnhance.Contrast(img).enhance(contrast)
+    img = ImageEnhance.Sharpness(img).enhance(sharpness)
+
+    # JPEG compression artifacts
+    buffer = io.BytesIO()
+    img.save(buffer, format="JPEG", quality=jpeg_quality)
+    buffer.seek(0)
+    img = Image.open(buffer).convert("RGB")
+
+    # Gaussian noise
+    arr = np.array(img).astype(np.int16)
+
+    noise = np.random.normal(
+        0,
+        noise_std,
+        arr.shape
+    ).astype(np.int16)
+
+    arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
+
+    return Image.fromarray(arr)
 
 
-def distort_single_png(input_png_path, output_folder=None):
-    input_png_path = Path(input_png_path)
+def generate_noise_versions(input_png, output_dir=None):
 
-    if output_folder is None:
-        output_folder = input_png_path.parent
+    input_png = Path(input_png)
+
+    if output_dir is None:
+        output_dir = input_png.parent / "distorted"
     else:
-        output_folder = Path(output_folder)
-        output_folder.mkdir(parents=True, exist_ok=True)
+        output_dir = Path(output_dir)
 
-    img = Image.open(input_png_path).convert("RGB")
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Noise
-    noisy_img = add_noise(img, noise_std=25)
-    noisy_img.save(output_folder / f"{input_png_path.stem}_noise.png")
+    original = Image.open(input_png).convert("RGB")
 
-    # 2. Blur
-    blurry_img = add_blur(img, radius=1.5)
-    blurry_img.save(output_folder / f"{input_png_path.stem}_blur.png")
+    for level in ["light", "medium", "heavy"]:
 
-    # 3. Skew / rotation
-    skewed_img = add_skew_rotation(img, angle=2.5)
-    skewed_img.save(output_folder / f"{input_png_path.stem}_skew.png")
+        distorted = apply_distortion(
+            original.copy(),
+            level=level
+        )
 
-    print("Saved:")
-    print(output_folder / f"{input_png_path.stem}_noise.png")
-    print(output_folder / f"{input_png_path.stem}_blur.png")
-    print(output_folder / f"{input_png_path.stem}_skew.png")
+        output_path = output_dir / f"{input_png.stem}_{level}.png"
+
+        distorted.save(output_path)
+
+        print(f"Saved: {output_path}")
 
 
-# Example usage
-distort_single_png(
-    input_png_path=r"H:\your_folder\sample.png",
-    output_folder=r"H:\your_folder\distorted_outputs"
+# Example
+generate_noise_versions(
+    input_png=r"H:\sample.png",
+    output_dir=r"H:\distorted_outputs"
 )
