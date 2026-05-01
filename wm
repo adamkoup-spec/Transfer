@@ -1,0 +1,27 @@
+\documentclass{article}
+
+\usepackage[margin=0in]{geometry}
+\usepackage{pdfpages}
+\usepackage{xcolor}
+\usepackage{tikz}
+\pagestyle{empty}
+
+\newcommand{\samplewatermark}{
+  \begin{tikzpicture}[remember picture,overlay]
+    \node[
+      rotate=45,
+      scale=10,
+      text=gray!40,
+      opacity=0.35
+    ] at (current page.center) {SAMPLE};
+  \end{tikzpicture}
+}
+
+\begin{document}
+
+\includepdf[
+  pages=-,
+  pagecommand={\samplewatermark}
+]{input.pdf}
+
+\end{document}
