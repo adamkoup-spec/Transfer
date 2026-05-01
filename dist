@@ -4,84 +4,83 @@ from pathlib import Path
 import io
 
 
+DISTORTION_LEVELS = {
+    "light": {
+        "noise_std": 5,
+        "blur_radius": 0.3,
+        "rotation": 0.3,
+        "contrast": 0.98,
+        "sharpness": 0.95,
+        "jpeg_quality": 92,
+        "resize_scale": 0.98,
+    },
+    "medium": {
+        "noise_std": 10,
+        "blur_radius": 0.7,
+        "rotation": 0.8,
+        "contrast": 0.92,
+        "sharpness": 0.85,
+        "jpeg_quality": 80,
+        "resize_scale": 0.93,
+    },
+    "heavy": {
+        "noise_std": 16,
+        "blur_radius": 1.0,
+        "rotation": 1.2,
+        "contrast": 0.85,
+        "sharpness": 0.75,
+        "jpeg_quality": 68,
+        "resize_scale": 0.88,
+    },
+}
+
+
 def apply_distortion(img, level="light"):
+    if level not in DISTORTION_LEVELS:
+        raise ValueError("level must be one of: light, medium, heavy")
 
-    if level == "light":
-        noise_std = 6
-        blur_radius = 0.5
-        rotation = 0.5
-        contrast = 0.97
-        sharpness = 0.9
-        jpeg_quality = 85
-        resize_scale = 0.97
+    p = DISTORTION_LEVELS[level]
 
-    elif level == "medium":
-        noise_std = 14
-        blur_radius = 1.2
-        rotation = 1.5
-        contrast = 0.85
-        sharpness = 0.7
-        jpeg_quality = 55
-        resize_scale = 0.85
+    img = img.convert("RGB")
 
-    elif level == "heavy":
-        noise_std = 28
-        blur_radius = 2.2
-        rotation = 3
-        contrast = 0.7
-        sharpness = 0.45
-        jpeg_quality = 28
-        resize_scale = 0.65
-
-    else:
-        raise ValueError("Choose light / medium / heavy")
-
-    # Slight skew/rotation
+    # Slight rotation
     img = img.rotate(
-        rotation,
+        p["rotation"],
         resample=Image.BICUBIC,
         expand=True,
         fillcolor="white"
     )
 
-    # Downsample / upsample degradation
+    # Mild resolution degradation
     w, h = img.size
     small = img.resize(
-        (int(w * resize_scale), int(h * resize_scale)),
+        (int(w * p["resize_scale"]), int(h * p["resize_scale"])),
         Image.BILINEAR
     )
-
     img = small.resize((w, h), Image.BILINEAR)
 
     # Blur
-    img = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    img = img.filter(ImageFilter.GaussianBlur(radius=p["blur_radius"]))
 
-    # Contrast / sharpness degradation
-    img = ImageEnhance.Contrast(img).enhance(contrast)
-    img = ImageEnhance.Sharpness(img).enhance(sharpness)
+    # Contrast and sharpness
+    img = ImageEnhance.Contrast(img).enhance(p["contrast"])
+    img = ImageEnhance.Sharpness(img).enhance(p["sharpness"])
 
-    # JPEG compression artifacts
+    # JPEG compression artifact simulation
     buffer = io.BytesIO()
-    img.save(buffer, format="JPEG", quality=jpeg_quality)
+    img.save(buffer, format="JPEG", quality=p["jpeg_quality"])
     buffer.seek(0)
     img = Image.open(buffer).convert("RGB")
 
     # Gaussian noise
     arr = np.array(img).astype(np.int16)
-
-    noise = np.random.normal(
-        0,
-        noise_std,
-        arr.shape
-    ).astype(np.int16)
-
+    noise = np.random.normal(0, p["noise_std"], arr.shape).astype(np.int16)
     arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
 
     return Image.fromarray(arr)
 
 
 def generate_noise_versions(input_png, output_dir=None):
-
     input_png = Path(input_png)
 
     if output_dir is None:
@@ -94,16 +93,9 @@ def generate_noise_versions(input_png, output_dir=None):
     original = Image.open(input_png).convert("RGB")
 
     for level in ["light", "medium", "heavy"]:
-
-        distorted = apply_distortion(
-            original.copy(),
-            level=level
-        )
-
+        distorted = apply_distortion(original.copy(), level=level)
         output_path = output_dir / f"{input_png.stem}_{level}.png"
-
         distorted.save(output_path)
-
         print(f"Saved: {output_path}")
 
 
