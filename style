@@ -1,0 +1,83 @@
+# =========================================================
+# PLOT STYLE HELPER
+# =========================================================
+
+BAR_COLORS = [
+    "#4C78A8",  # blue
+    "#F58518",  # orange
+    "#54A24B",  # green
+    "#E45756",  # red
+    "#72B7B2",  # teal
+    "#B279A2",  # purple
+]
+
+def style_bar_plot(
+    ax,
+    title=None,
+    xlabel=None,
+    ylabel=None,
+    ylim=(0, 1.10),
+    show_values=True,
+    value_fmt="%.2f",
+):
+    # Remove top/right box
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    # Light grid only on y-axis
+    ax.grid(axis="y", linestyle="--", alpha=0.30)
+    ax.set_axisbelow(True)
+
+    # Titles/labels
+    if title:
+        ax.set_title(title, fontsize=13, fontweight="bold", pad=12)
+    if xlabel:
+        ax.set_xlabel(xlabel, fontsize=11)
+    if ylabel:
+        ax.set_ylabel(ylabel, fontsize=11)
+
+    # Tick styling
+    ax.tick_params(axis="x", labelrotation=0)
+    ax.tick_params(axis="both", labelsize=10)
+
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+
+    # Value labels
+    if show_values:
+        for container in ax.containers:
+            ax.bar_label(container, fmt=value_fmt, fontsize=8, padding=2)
+
+    # Cleaner legend
+    legend = ax.get_legend()
+    if legend is not None:
+        legend.set_frame_on(False)
+        legend.set_title(legend.get_title().get_text(), prop={"size": 10})
+        for text in legend.get_texts():
+            text.set_fontsize(9)
+
+
+
+
+ax = pivot.plot(
+    kind="bar",
+    figsize=(12, 6),
+    color=BAR_COLORS[:len(pivot.columns)],
+    width=0.78,
+)
+
+ax.legend(title="Stress Condition", bbox_to_anchor=(1.02, 1), loc="upper left")
+
+style_bar_plot(
+    ax,
+    title=title,
+    xlabel="Doc Type",
+    ylabel=metric.replace("_", " ").title(),
+    ylim=(0, 1.10),
+    show_values=True,
+    value_fmt="%.2f",
+)
+
+plt.tight_layout()
+plt.savefig(output_path, dpi=150, bbox_inches="tight")
+plt.close()
